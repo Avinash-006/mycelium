@@ -135,6 +135,9 @@ func main() {
 			{StepID: "publish", ToolID: "external_operation"},
 		},
 	}
+	if err := client.AssertCompositeCompatible(ctx); err != nil {
+		panic(err)
+	}
 	_, firstParent, err := client.ClaimComposite(ctx, manifest)
 	if err != nil {
 		panic(err)

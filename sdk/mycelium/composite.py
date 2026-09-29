@@ -450,6 +450,7 @@ class _ControlStore:
             if rec["owner"] != owner or not live:
                 rec["fence"] = int(rec.get("fence", 0)) + 1
             rec["owner"] = owner
+            rec["lease_ttl"] = lease_ttl
             rec["lease_until"] = now + lease_ttl if lease_ttl > 0 else None
             rec["status"] = "RUNNING"
             data[key] = rec

@@ -49,7 +49,7 @@ function projection(raw: Record<string, unknown>): EffectReply {
 }
 
 function compositeProjection(raw: Record<string, unknown>): CompositeReply {
-  if (raw.protocol_version !== PROTOCOL_VERSION || typeof raw.operation_id !== "string" ||
+  if (raw.protocol_version !== PROTOCOL_VERSION || raw.composite_protocol_version !== "composite-v1" || typeof raw.operation_id !== "string" ||
       typeof raw.definition !== "string" || typeof raw.manifest_digest !== "string" ||
       !/^[0-9a-f]{64}$/.test(raw.manifest_digest) ||
       (raw.status !== "RUNNING" && raw.status !== "COMPLETED") ||
@@ -59,7 +59,7 @@ function compositeProjection(raw: Record<string, unknown>): CompositeReply {
     throw new MyceliumProtocolError("invalid composite response", { code: "INVALID_RESPONSE", httpStatus: 200 });
   }
   return {
-    protocolVersion: raw.protocol_version, operationId: raw.operation_id,
+    protocolVersion: raw.protocol_version, compositeProtocolVersion: "composite-v1", operationId: raw.operation_id,
     definition: raw.definition, manifestDigest: raw.manifest_digest,
     status: raw.status, ownerId: typeof raw.owner_id === "string" ? raw.owner_id : null,
     fence: raw.fence, leaseUntil: typeof raw.lease_until === "number" ? raw.lease_until : null,
@@ -84,6 +84,13 @@ export class MyceliumClient {
   async assertCompatible(): Promise<CapabilitiesReply> {
     const value = await this.capabilities();
     for (const operation of ["derive_identity", "claim_effect", "inspect_effect", "complete_effect"]) if (!value.operations.includes(operation)) throw new MyceliumProtocolError("required sidecar operation is unavailable", { code: "UNSUPPORTED_CAPABILITY", httpStatus: 200 });
+    return value;
+  }
+  async assertCompositeCompatible(): Promise<CapabilitiesReply> {
+    const value = await this.assertCompatible();
+    const operations = (value.extensions as Record<string, string[]> | undefined)?.["composite-v1"];
+    for (const operation of ["claim_composite", "claim_composite_step", "boundary_composite_step", "complete_composite_step", "resolve_composite_step", "finish_composite"])
+      if (!Array.isArray(operations) || !operations.includes(operation)) throw new MyceliumProtocolError("composite-v1 extension is unavailable", { code: "UNSUPPORTED_CAPABILITY", httpStatus: 200 });
     return value;
   }
   async deriveIdentity(request: IdentityRequest): Promise<IdentityReply> {
@@ -128,10 +135,10 @@ export class MyceliumClient {
     };
   }
   private compositePath(handle: CompositeHandle): string {
-    return `/v1/composites/${encodeURIComponent(handle.operationId)}`;
+    return `/extensions/composite-v1/composites/${encodeURIComponent(handle.operationId)}`;
   }
   async claimComposite(request: ClaimCompositeRequest): Promise<{ composite: CompositeReply; handle: CompositeHandle }> {
-    const raw = await this.transport.request<Record<string, unknown>>("POST", "/v1/composites/claim", {
+    const raw = await this.transport.request<Record<string, unknown>>("POST", "/extensions/composite-v1/composites/claim", {
       tenant_id: this.options.tenantId, application_id: this.options.applicationId,
       operation_id: request.operationId, definition: request.definition,
       steps: request.steps.map(step => ({ step_id: step.stepId, tool_id: step.toolId })),
@@ -142,7 +149,7 @@ export class MyceliumClient {
     return { composite, handle: { operationId: composite.operationId, ownerId: composite.ownerId, fence: composite.fence } };
   }
   async getComposite(operationId: string): Promise<CompositeReply> {
-    return compositeProjection(await this.transport.request("GET", `/v1/composites/${encodeURIComponent(operationId)}`));
+    return compositeProjection(await this.transport.request("GET", `/extensions/composite-v1/composites/${encodeURIComponent(operationId)}`));
   }
   async renewComposite(handle: CompositeHandle, leaseTtl?: number): Promise<CompositeReply> {
     return compositeProjection(await this.transport.request("POST", `${this.compositePath(handle)}/renew`,

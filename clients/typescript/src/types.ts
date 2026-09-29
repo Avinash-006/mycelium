@@ -96,6 +96,7 @@ export interface ClaimCompositeRequest {
 }
 export interface CompositeReply {
   protocolVersion: string;
+  compositeProtocolVersion: "composite-v1";
   operationId: string;
   definition: string;
   manifestDigest: string;

@@ -120,3 +120,19 @@ def test_resume_replays_first_child_and_rejects_stale_parent(tmp_path) -> None:
     with pytest.raises(SidecarError) as drift:
         service.claim_composite({**_manifest(), "definition": "publish-v2"})
     assert drift.value.code == "DEFINITION_DRIFT"
+
+
+def test_child_effect_identity_is_bound_to_parent_and_step(tmp_path) -> None:
+    service = _service(tmp_path)
+    identity = _identity("create")
+    parent_a = service.claim_composite(_manifest())
+    child_a = service.composite_command(
+        "job-1", "claim", _command(parent_a, identity=identity), "create"
+    )
+    manifest_b = {**_manifest(), "operation_id": "job-2"}
+    parent_b = service.claim_composite(manifest_b)
+    child_b = service.composite_command(
+        "job-2", "claim", _command(parent_b, identity=identity), "create"
+    )
+    assert child_a["effect_id"] != child_b["effect_id"]
+    assert child_a["effect_id"] != service.derive(identity)["effect_id"]

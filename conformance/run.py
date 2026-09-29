@@ -634,6 +634,45 @@ def main() -> int:
                 environment=environment,
                 client="go",
             )
+            composite_manifest = {
+                "tenant_id": TENANT_ID,
+                "application_id": APPLICATION_ID,
+                "operation_id": "conformance-composite-restart",
+                "definition": "restart-v1",
+                "steps": [{"step_id": "first", "tool_id": "external_operation"}],
+                "lease_ttl": 1,
+            }
+            parent = require_status(
+                request(base_url, "POST", "/extensions/composite-v1/composites/claim", body=composite_manifest),
+                200, "composite parent claim",
+            )
+            first_identity = identity("conformance-composite-restart-first")
+            parent_body = {
+                "tenant_id": TENANT_ID, "application_id": APPLICATION_ID,
+                "owner_id": parent["owner_id"], "fence": parent["fence"],
+                "identity": first_identity,
+            }
+            step_path = "/extensions/composite-v1/composites/conformance-composite-restart/steps/first"
+            child = require_status(
+                request(base_url, "POST", step_path + "/claim", body={
+                    **parent_body,
+                    "decision": {"allowed": True, "verdicts": [], "denied_reasons": []},
+                }), 200, "composite child claim",
+            )
+            assert child["disposition"] == "EXECUTE"
+            child_body = {
+                **parent_body,
+                "effect_owner_id": child["owner_id"], "effect_fence": child["fence"],
+            }
+            require_status(
+                request(base_url, "POST", step_path + "/boundary", body=child_body),
+                200, "composite child boundary",
+            )
+            require_status(
+                request(base_url, "POST", step_path + "/complete", body={
+                    **child_body, "result": {"saved": True},
+                }), 200, "composite child completion",
+            )
             failure_checks, restart_request_id = crash_and_concurrency_checks(
                 base_url, environment, go_driver
             )
@@ -650,6 +689,43 @@ def main() -> int:
             ),
         }
         try:
+            restarted_url = restarted_environment["MYCELIUM_CONFORMANCE_URL"]
+            time.sleep(1.1)
+            resumed = require_status(
+                request(restarted_url, "POST", "/extensions/composite-v1/composites/claim", body=composite_manifest),
+                200, "composite parent resume after sidecar restart",
+            )
+            assert resumed["fence"] > parent["fence"]
+            stale_status, stale_payload = request(
+                restarted_url, "POST",
+                "/extensions/composite-v1/composites/conformance-composite-restart/finish",
+                body={key: parent_body[key] for key in (
+                    "tenant_id", "application_id", "owner_id", "fence"
+                )},
+            )
+            assert stale_status == 409 and stale_payload["error"]["code"] == "STALE_FENCE"
+            resumed_body = {
+                **parent_body,
+                "owner_id": resumed["owner_id"], "fence": resumed["fence"],
+            }
+            replay = require_status(
+                request(restarted_url, "POST", step_path + "/claim", body=resumed_body),
+                200, "composite child replay after restart",
+            )
+            assert replay["disposition"] == "RETURN_STORED_RESULT"
+            assert replay["result"] == {"saved": True}
+            require_status(
+                request(restarted_url, "POST", step_path + "/resolve", body=resumed_body),
+                200, "composite child resolution after restart",
+            )
+            finished = require_status(
+                request(restarted_url, "POST",
+                        "/extensions/composite-v1/composites/conformance-composite-restart/finish",
+                        body=resumed_body),
+                200, "composite finish after restart",
+            )
+            assert finished["status"] == "COMPLETED"
+            failure_checks.append("composite-restart-stored-result-fencing")
             restart_results = [
                 run_crash_driver(
                     client,

@@ -354,6 +354,29 @@ func (c *Client) AssertCompatible(ctx context.Context) error {
 	}
 	return nil
 }
+
+func (c *Client) AssertCompositeCompatible(ctx context.Context) error {
+	if err := c.AssertCompatible(ctx); err != nil {
+		return err
+	}
+	caps, err := c.Capabilities(ctx)
+	if err != nil {
+		return err
+	}
+	available := make(map[string]bool)
+	for _, operation := range caps.Extensions["composite-v1"] {
+		available[operation] = true
+	}
+	for _, required := range []string{
+		"claim_composite", "claim_composite_step", "boundary_composite_step",
+		"complete_composite_step", "resolve_composite_step", "finish_composite",
+	} {
+		if !available[required] {
+			return &ProtocolError{Code: "UNSUPPORTED_CAPABILITY", Message: "composite-v1 extension is unavailable", HTTPStatus: 200}
+		}
+	}
+	return nil
+}
 func (c *Client) DeriveEffectIdentity(ctx context.Context, in IdentityRequest) (*DeriveIdentityReply, error) {
 	var out DeriveIdentityReply
 	err := c.request(ctx, "deriveEffectIdentity", http.MethodPost, "/v1/identities/derive", c.identity(in), &out, true)
@@ -446,7 +469,7 @@ func (c *Client) ReconcileEffect(ctx context.Context, id EffectID, in ReconcileE
 }
 
 func validateCompositeReply(reply *CompositeReply) error {
-	if reply.ProtocolVersion != ProtocolVersionV1Alpha1 || reply.OperationID == "" ||
+	if reply.ProtocolVersion != ProtocolVersionV1Alpha1 || reply.CompositeProtocolVersion != "composite-v1" || reply.OperationID == "" ||
 		len(reply.ManifestDigest) != 64 || (reply.Status != "RUNNING" && reply.Status != "COMPLETED") ||
 		reply.Fence <= 0 || reply.NextStep < 0 || reply.Children == nil {
 		return &ProtocolError{Code: "INVALID_RESPONSE", Message: "sidecar returned invalid composite state", HTTPStatus: 200}
@@ -455,7 +478,7 @@ func validateCompositeReply(reply *CompositeReply) error {
 }
 
 func (c *Client) compositePath(handle *CompositeHandle) string {
-	return "/v1/composites/" + neturl.PathEscape(handle.OperationID)
+	return "/extensions/composite-v1/composites/" + neturl.PathEscape(handle.OperationID)
 }
 
 func (c *Client) compositeBody(handle *CompositeHandle, extra map[string]any) map[string]any {
@@ -478,7 +501,7 @@ func (c *Client) ClaimComposite(ctx context.Context, in ClaimCompositeRequest) (
 		body["lease_ttl"] = *in.LeaseTTL
 	}
 	var out CompositeReply
-	if err := c.request(ctx, "claimComposite", http.MethodPost, "/v1/composites/claim", body, &out, true); err != nil {
+	if err := c.request(ctx, "claimComposite", http.MethodPost, "/extensions/composite-v1/composites/claim", body, &out, true); err != nil {
 		return nil, nil, err
 	}
 	if err := validateCompositeReply(&out); err != nil {
@@ -492,7 +515,7 @@ func (c *Client) ClaimComposite(ctx context.Context, in ClaimCompositeRequest) (
 
 func (c *Client) GetComposite(ctx context.Context, operationID string) (*CompositeReply, error) {
 	var out CompositeReply
-	err := c.request(ctx, "getComposite", http.MethodGet, "/v1/composites/"+neturl.PathEscape(operationID), nil, &out, true)
+	err := c.request(ctx, "getComposite", http.MethodGet, "/extensions/composite-v1/composites/"+neturl.PathEscape(operationID), nil, &out, true)
 	if err == nil {
 		err = validateCompositeReply(&out)
 	}

@@ -248,6 +248,10 @@ def openapi_document() -> dict[str, Any]:
                 "identity_namespace": {"const": "identity-v1"},
                 "capabilities": {"type": "array", "items": {"type": "string"}},
                 "operations": {"type": "array", "items": {"type": "string"}},
+                "extensions": {
+                    "type": "object",
+                    "additionalProperties": {"type": "array", "items": {"type": "string"}},
+                },
                 "development_only": {"const": True},
             },
             "additionalProperties": True,
@@ -675,11 +679,13 @@ def openapi_document() -> dict[str, Any]:
     schemas["CompositeReply"] = {
         "type": "object",
         "required": [
-            "protocol_version", "operation_id", "definition", "manifest_digest", "status",
+            "protocol_version", "composite_protocol_version", "operation_id", "definition",
+            "manifest_digest", "status",
             "owner_id", "fence", "lease_until", "next_step", "children",
         ],
         "properties": {
             "protocol_version": ref("ProtocolVersion"),
+            "composite_protocol_version": {"const": "composite-v1"},
             "operation_id": string(max_length=128),
             "definition": string(max_length=256),
             "manifest_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
@@ -691,10 +697,10 @@ def openapi_document() -> dict[str, Any]:
             "children": {"type": "object", "additionalProperties": ref("JsonObject")},
         },
     }
-    paths["/v1/composites/claim"] = post(
+    paths["/extensions/composite-v1/composites/claim"] = post(
         "ClaimCompositeRequest", "CompositeReply", "claimComposite"
     )
-    paths["/v1/composites/{operation_id}"] = {
+    paths["/extensions/composite-v1/composites/{operation_id}"] = {
         "get": {
             "operationId": "getComposite",
             "summary": "Inspect a composite parent",
@@ -707,11 +713,15 @@ def openapi_document() -> dict[str, Any]:
         }
     }
     for action in ("renew", "release", "finish"):
-        paths[f"/v1/composites/{{operation_id}}/{action}"] = post(
+        paths[f"/extensions/composite-v1/composites/{{operation_id}}/{action}"] = post(
             "CompositeCommandRequest", "CompositeReply", f"{action}Composite"
         )
     for action in ("claim", "boundary", "complete", "resolve"):
-        paths[f"/v1/composites/{{operation_id}}/steps/{{step_id}}/{action}"] = post(
+        step_path = (
+            f"/extensions/composite-v1/composites/{{operation_id}}/steps/"
+            f"{{step_id}}/{action}"
+        )
+        paths[step_path] = post(
             "CompositeStepCommandRequest",
             "CompositeReply" if action == "resolve" else (
                 "ClaimEffectReply" if action == "claim" else "EffectInspectionReply"
@@ -1398,16 +1408,15 @@ class SidecarService:
                 "complete_effect",
                 "fail_effect",
                 "request_reconciliation",
-                "claim_composite",
-                "inspect_composite",
-                "renew_composite",
-                "release_composite",
-                "finish_composite",
-                "claim_composite_step",
-                "boundary_composite_step",
-                "complete_composite_step",
-                "resolve_composite_step",
             ],
+            "extensions": {
+                "composite-v1": [
+                    "claim_composite", "inspect_composite", "renew_composite",
+                    "release_composite", "finish_composite", "claim_composite_step",
+                    "boundary_composite_step", "complete_composite_step",
+                    "resolve_composite_step",
+                ]
+            },
             "development_only": True,
         }
 
@@ -1483,8 +1492,8 @@ class SidecarService:
         return CompositeManifest(payload["function"], definition, tuple(parsed), digest)
 
     @staticmethod
-    def _composite_ttl(body: dict[str, Any]) -> float:
-        value = body.get("lease_ttl", 30.0)
+    def _composite_ttl(body: dict[str, Any], default: float = 30.0) -> float:
+        value = body.get("lease_ttl", default)
         if (
             isinstance(value, bool)
             or not isinstance(value, (int, float))
@@ -1523,6 +1532,7 @@ class SidecarService:
     def _composite_projection(self, record: dict[str, Any]) -> dict[str, Any]:
         return {
             "protocol_version": self.config.protocol_version,
+            "composite_protocol_version": "composite-v1",
             "operation_id": record["operation_id"].rsplit(":", 1)[-1],
             "definition": record["definition"],
             "manifest_digest": record["manifest_digest"],
@@ -1532,6 +1542,31 @@ class SidecarService:
             "lease_until": record["lease_until"],
             "next_step": record["next_step"],
             "children": record["children"],
+        }
+
+    @staticmethod
+    def _composite_identity(
+        identity: dict[str, Any], record: dict[str, Any], step_id: str
+    ) -> dict[str, Any]:
+        scope = identity.get("execution_scope")
+        if not isinstance(scope, dict) or "_mycelium_composite" in scope:
+            raise SidecarError(
+                "INVALID_REQUEST", "composite identity needs an unmodified execution_scope"
+            )
+        if "expected_effect_id" in identity or "effect_id" in identity:
+            raise SidecarError(
+                "INVALID_REQUEST", "composite child effect identity is derived by the sidecar"
+            )
+        return {
+            **identity,
+            "execution_scope": {
+                **scope,
+                "_mycelium_composite": {
+                    "parent": record["operation_id"],
+                    "definition": record["definition"],
+                    "step": step_id,
+                },
+            },
         }
 
     def composite_command(
@@ -1562,7 +1597,7 @@ class SidecarService:
             raise SidecarError("NOT_FOUND", "composite not found", status=404)
         if record["owner"] != owner or record["fence"] != fence:
             raise SidecarError("STALE_FENCE", "composite parent authority was lost", status=409)
-        ttl = self._composite_ttl(body)
+        ttl = self._composite_ttl(body, record.get("lease_ttl", 30.0))
         try:
             if action == "renew":
                 store.renew(key, owner, fence, ttl)
@@ -1602,7 +1637,8 @@ class SidecarService:
                     raise SidecarError(
                         "INVALID_REQUEST", "step identity tool does not match manifest"
                     )
-                canonical, effect_id = self._identity(identity)
+                scoped_identity = self._composite_identity(identity, record, step_id)
+                canonical, effect_id = self._identity(scoped_identity)
                 binding = {
                     "effect_id": effect_id,
                     "args_fingerprint": hashlib.sha256(canonical.encode()).hexdigest(),
@@ -1612,9 +1648,10 @@ class SidecarService:
                 }
                 if action == "claim":
                     store.admit(key, owner, fence, step, binding, ttl)
-                    return self.claim(
-                        {**identity, **{k: body[k] for k in ("decision", "lease_ttl") if k in body}}
-                    )
+                    return self.claim({
+                        **scoped_identity,
+                        **{k: body[k] for k in ("decision", "lease_ttl") if k in body},
+                    })
                 child = record["children"].get(step_id)
                 if child is None or any(child.get(k) != v for k, v in binding.items()):
                     raise SidecarError(
@@ -1633,7 +1670,9 @@ class SidecarService:
                         body.get("effect_owner_id"),
                         body.get("effect_fence"),
                     )
-                    command = {**identity, "owner_id": effect_owner, "fence": effect_fence}
+                    command = {
+                        **scoped_identity, "owner_id": effect_owner, "fence": effect_fence,
+                    }
                     if action == "boundary":
                         command["boundary"] = "maybe_crossed"
                     else:
@@ -2030,11 +2069,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             if path == "/v1/openapi.json":
                 self._reply(openapi_document())
                 return
-            if path.startswith("/v1/composites/"):
+            if path.startswith("/extensions/composite-v1/composites/"):
                 parts = path.strip("/").split("/")
-                if len(parts) != 3:
+                if len(parts) != 4:
                     raise SidecarError("NOT_FOUND", "endpoint not found", status=404)
-                self._reply(self._service().get_composite(_effect_path_segment(parts[2])))
+                self._reply(self._service().get_composite(_effect_path_segment(parts[3])))
                 return
             if path.startswith("/v1/effects/"):
                 effect_id = _effect_path_segment(path.rsplit("/", 1)[-1])
@@ -2097,25 +2136,25 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             if path == "/v1/identities/derive":
                 result = self._service().derive(body)
                 status = 200
-            elif path == "/v1/composites/claim":
+            elif path == "/extensions/composite-v1/composites/claim":
                 result = self._service().claim_composite(body)
                 status = 200
-            elif path.startswith("/v1/composites/"):
+            elif path.startswith("/extensions/composite-v1/composites/"):
                 parts = path.strip("/").split("/")
-                if len(parts) == 4 and parts[3] in {"renew", "release", "finish"}:
+                if len(parts) == 5 and parts[4] in {"renew", "release", "finish"}:
                     result = self._service().composite_command(
-                        _effect_path_segment(parts[2]), parts[3], body
+                        _effect_path_segment(parts[3]), parts[4], body
                     )
                 elif (
-                    len(parts) == 6
-                    and parts[3] == "steps"
-                    and parts[5] in {"claim", "boundary", "complete", "resolve"}
+                    len(parts) == 7
+                    and parts[4] == "steps"
+                    and parts[6] in {"claim", "boundary", "complete", "resolve"}
                 ):
                     result = self._service().composite_command(
-                        _effect_path_segment(parts[2]),
-                        parts[5],
+                        _effect_path_segment(parts[3]),
+                        parts[6],
                         body,
-                        _effect_path_segment(parts[4]),
+                        _effect_path_segment(parts[5]),
                     )
                 else:
                     raise SidecarError("NOT_FOUND", "endpoint not found", status=404)

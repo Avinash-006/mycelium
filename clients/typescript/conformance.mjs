@@ -89,6 +89,7 @@ const manifest = {
   steps: [{ stepId: "prepare", toolId: "external_operation" },
     { stepId: "publish", toolId: "external_operation" }],
 };
+await client.assertCompositeCompatible();
 const firstParent = (await client.claimComposite(manifest)).handle;
 const firstStepIdentity = identity("conformance-typescript-composite-prepare");
 const firstStep = await client.claimCompositeStep(firstParent, "prepare", { ...firstStepIdentity, decision });
