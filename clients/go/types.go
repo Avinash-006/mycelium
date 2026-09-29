@@ -152,16 +152,45 @@ type ClaimReply struct {
 	Disposition ClaimDisposition `json:"disposition"`
 	Handle      *EffectHandle    `json:"-"`
 }
+type CompositeStep struct {
+	StepID string `json:"step_id"`
+	ToolID string `json:"tool_id"`
+}
+type ClaimCompositeRequest struct {
+	OperationID string          `json:"operation_id"`
+	Definition  string          `json:"definition"`
+	Steps       []CompositeStep `json:"steps"`
+	LeaseTTL    *float64        `json:"lease_ttl,omitempty"`
+}
+type CompositeReply struct {
+	ProtocolVersion          ProtocolVersion           `json:"protocol_version"`
+	CompositeProtocolVersion string                    `json:"composite_protocol_version"`
+	OperationID              string                    `json:"operation_id"`
+	Definition               string                    `json:"definition"`
+	ManifestDigest           string                    `json:"manifest_digest"`
+	Status                   string                    `json:"status"`
+	OwnerID                  *OwnerID                  `json:"owner_id"`
+	Fence                    Fence                     `json:"fence"`
+	LeaseUntil               *float64                  `json:"lease_until"`
+	NextStep                 int                       `json:"next_step"`
+	Children                 map[string]map[string]any `json:"children"`
+}
+type CompositeHandle struct {
+	OperationID string
+	OwnerID     OwnerID
+	Fence       Fence
+}
 type HealthReply struct {
 	Status          string          `json:"status"`
 	ProtocolVersion ProtocolVersion `json:"protocol_version"`
 }
 type CapabilitiesReply struct {
-	ProtocolVersion   ProtocolVersion `json:"protocol_version"`
-	IdentityNamespace string          `json:"identity_namespace"`
-	Capabilities      []string        `json:"capabilities"`
-	Operations        []string        `json:"operations"`
-	DevelopmentOnly   bool            `json:"development_only"`
+	ProtocolVersion   ProtocolVersion     `json:"protocol_version"`
+	IdentityNamespace string              `json:"identity_namespace"`
+	Capabilities      []string            `json:"capabilities"`
+	Operations        []string            `json:"operations"`
+	Extensions        map[string][]string `json:"extensions,omitempty"`
+	DevelopmentOnly   bool                `json:"development_only"`
 }
 type DeriveIdentityReply struct {
 	ProtocolVersion   ProtocolVersion `json:"protocol_version"`

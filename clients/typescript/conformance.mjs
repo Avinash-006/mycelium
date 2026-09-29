@@ -83,6 +83,36 @@ assert.equal(replay.disposition, "RETURN_STORED_RESULT");
 assert.deepEqual(replay.result, { client: "typescript" });
 checks.push("claim-complete-replay");
 
+const manifest = {
+  operationId: "conformance-typescript-composite",
+  definition: "publish-v1",
+  steps: [{ stepId: "prepare", toolId: "external_operation" },
+    { stepId: "publish", toolId: "external_operation" }],
+};
+await client.assertCompositeCompatible();
+const firstParent = (await client.claimComposite(manifest)).handle;
+const firstStepIdentity = identity("conformance-typescript-composite-prepare");
+const firstStep = await client.claimCompositeStep(firstParent, "prepare", { ...firstStepIdentity, decision });
+assert.equal(firstStep.disposition, "EXECUTE");
+await client.boundaryCompositeStep(firstParent, "prepare", firstStep.handle);
+await client.completeCompositeStep(firstParent, "prepare", firstStep.handle, { prepared: true });
+await client.releaseComposite(firstParent);
+
+const resumedParent = (await client.claimComposite(manifest)).handle;
+assert(resumedParent.fence > firstParent.fence);
+await expectError(() => client.finishComposite(firstParent), MyceliumProtocolError, "STALE_FENCE");
+const replayedStep = await client.claimCompositeStep(resumedParent, "prepare", { ...firstStepIdentity, decision });
+assert.equal(replayedStep.disposition, "RETURN_STORED_RESULT");
+assert.deepEqual(replayedStep.result, { prepared: true });
+await client.resolveCompositeStep(resumedParent, "prepare", firstStepIdentity);
+const secondStepIdentity = identity("conformance-typescript-composite-publish");
+const secondStep = await client.claimCompositeStep(resumedParent, "publish", { ...secondStepIdentity, decision });
+assert.equal(secondStep.disposition, "EXECUTE");
+await client.boundaryCompositeStep(resumedParent, "publish", secondStep.handle);
+await client.completeCompositeStep(resumedParent, "publish", secondStep.handle, { published: true });
+assert.equal((await client.finishComposite(resumedParent)).status, "COMPLETED");
+checks.push("composite-resume-fencing");
+
 const staleIdentity = identity("conformance-typescript-stale-fence");
 const staleClaim = await client.claimEffect({ ...staleIdentity, decision });
 assert.equal(staleClaim.disposition, "EXECUTE");

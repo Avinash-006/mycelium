@@ -76,6 +76,17 @@ or automatic provider call. A timeout or connection reset means the state may ha
 changed and is not proof of safe failure. Inspect the effect before deciding what to
 do next. Direct provider calls outside this lifecycle bypass the protection.
 
+For a straight-line sequence of consequential effects, the optional
+`composite-v1` sidecar extension provides `claimComposite`,
+`claimCompositeStep`, `boundaryCompositeStep`, `completeCompositeStep`,
+`resolveCompositeStep`, and `finishComposite`. Call
+`assertCompositeCompatible()` first. Declare the complete ordered step list
+with a stable operation ID and definition; after a crash, reclaim that same
+manifest and replay completed child results before proceeding. Renew the parent
+lease during long provider calls. See the
+[composite recovery guide](../../sdk/docs/COMPOSITE_RECOVERY.md) for the
+protocol and its limits.
+
 The client preserves `UNKNOWN`, denial, terminal, and wait dispositions. Unknown
 future dispositions fail closed. Reconciliation, provider attestation, operator
 authorization, hostile clients, public multi-tenant hosting, and production IAM

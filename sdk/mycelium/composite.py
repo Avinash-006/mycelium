@@ -398,6 +398,20 @@ class _ControlStore:
         assert self._lock is not None
         return self._lock.read_modify_write(fn)
 
+    def load(self, key: str) -> dict[str, Any] | None:
+        """Read a parent record without changing its revision or lease."""
+        if self._atomic is not None:
+            value = self._atomic.get(key)
+            return dict(value) if value is not None else None
+        if self._memory is not None:
+            with self._memory_lock:
+                value = self._memory.get(key)
+                return json.loads(json.dumps(value)) if value is not None else None
+        assert self._lock is not None
+        return self._lock.read_modify_write_no_save(
+            lambda data: json.loads(json.dumps(data[key])) if key in data else None
+        )
+
     def create_or_load(self, key: str, manifest: CompositeManifest, namespace: str) -> dict[str, Any]:
         def mutate(data: dict[str, Any]) -> dict[str, Any]:
             current = data.get(key)
@@ -415,6 +429,8 @@ class _ControlStore:
                     "fence": 0,
                     "next_step": 0,
                     "children": {},
+                    "replay_observed": [],
+                    "replay_resolved": [],
                 }
                 data[key] = current
             elif current.get("manifest_digest") != manifest.digest or current.get("definition") != manifest.definition:
@@ -435,7 +451,10 @@ class _ControlStore:
                 raise CompositeBusyError(f"composite {key!r} is owned by a live worker")
             if rec["owner"] != owner or not live:
                 rec["fence"] = int(rec.get("fence", 0)) + 1
+                rec["replay_observed"] = []
+                rec["replay_resolved"] = []
             rec["owner"] = owner
+            rec["lease_ttl"] = lease_ttl
             rec["lease_until"] = now + lease_ttl if lease_ttl > 0 else None
             rec["status"] = "RUNNING"
             data[key] = rec
@@ -479,11 +498,19 @@ class _ControlStore:
                 comparable_old = {k: v for k, v in old.items() if k != "outcome"}
                 if comparable_old != binding:
                     raise CompositeDefinitionDriftError(f"argument or destination drift at step {step.step_id}")
-            if index < next_step:
-                if old is None:
+            if index < next_step and old is None:
+                raise CompositeDefinitionDriftError(
+                    f"manifest step {step.step_id!r} is missing durable child evidence"
+                )
+            observed = rec.setdefault("replay_observed", [])
+            resolved = rec.setdefault("replay_resolved", [])
+            if not observed or observed[-1] != step.step_id:
+                if index != len(observed) or len(resolved) != len(observed):
                     raise CompositeDefinitionDriftError(
-                        f"manifest step {step.step_id!r} is missing durable child evidence"
+                        f"current replay encountered step {step.step_id!r} out of order"
                     )
+                observed.append(step.step_id)
+            if index < next_step:
                 return
             rec["children"][step.step_id] = {**binding, "outcome": "ADMITTED"}
             rec["next_step"] = index + 1
@@ -500,7 +527,13 @@ class _ControlStore:
                 raise CompositeDefinitionDriftError(f"child {step.step_id!r} was not admitted")
             if child.get("outcome") not in {"ADMITTED", "COMPLETED"}:
                 raise CompositeDefinitionDriftError(f"child {step.step_id!r} has invalid outcome evidence")
+            observed = rec.get("replay_observed", [])
+            resolved = rec.setdefault("replay_resolved", [])
+            if not observed or observed[-1] != step.step_id or len(resolved) < len(observed) - 1:
+                raise CompositeDefinitionDriftError(f"child {step.step_id!r} resolved out of order")
             child["outcome"] = "COMPLETED"
+            if step.step_id not in resolved:
+                resolved.append(step.step_id)
         self._mutate(key, mutate)
 
     def boundary(self, key: str, owner: str, fence: int, lease_ttl: float) -> None:
@@ -534,6 +567,13 @@ class _ControlStore:
             if resolved_step_ids != frozenset(expected_step_ids):
                 raise CompositeDefinitionDriftError(
                     "current replay admitted children without resolving every required outcome"
+                )
+            if (
+                tuple(rec.get("replay_observed", [])) != expected_step_ids
+                or tuple(rec.get("replay_resolved", [])) != expected_step_ids
+            ):
+                raise CompositeDefinitionDriftError(
+                    "durable current replay evidence is incomplete or out of order"
                 )
             children = rec.get("children", {})
             if any(children.get(step_id, {}).get("outcome") != "COMPLETED" for step_id in expected_step_ids):

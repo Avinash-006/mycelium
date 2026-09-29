@@ -354,6 +354,29 @@ func (c *Client) AssertCompatible(ctx context.Context) error {
 	}
 	return nil
 }
+
+func (c *Client) AssertCompositeCompatible(ctx context.Context) error {
+	if err := c.AssertCompatible(ctx); err != nil {
+		return err
+	}
+	caps, err := c.Capabilities(ctx)
+	if err != nil {
+		return err
+	}
+	available := make(map[string]bool)
+	for _, operation := range caps.Extensions["composite-v1"] {
+		available[operation] = true
+	}
+	for _, required := range []string{
+		"claim_composite", "claim_composite_step", "boundary_composite_step",
+		"complete_composite_step", "resolve_composite_step", "finish_composite",
+	} {
+		if !available[required] {
+			return &ProtocolError{Code: "UNSUPPORTED_CAPABILITY", Message: "composite-v1 extension is unavailable", HTTPStatus: 200}
+		}
+	}
+	return nil
+}
 func (c *Client) DeriveEffectIdentity(ctx context.Context, in IdentityRequest) (*DeriveIdentityReply, error) {
 	var out DeriveIdentityReply
 	err := c.request(ctx, "deriveEffectIdentity", http.MethodPost, "/v1/identities/derive", c.identity(in), &out, true)
@@ -443,6 +466,134 @@ func (c *Client) ReconcileEffect(ctx context.Context, id EffectID, in ReconcileE
 		return nil, err
 	}
 	return &out, nil
+}
+
+func validateCompositeReply(reply *CompositeReply) error {
+	if reply.ProtocolVersion != ProtocolVersionV1Alpha1 || reply.CompositeProtocolVersion != "composite-v1" || reply.OperationID == "" ||
+		len(reply.ManifestDigest) != 64 || (reply.Status != "RUNNING" && reply.Status != "COMPLETED") ||
+		reply.Fence <= 0 || reply.NextStep < 0 || reply.Children == nil {
+		return &ProtocolError{Code: "INVALID_RESPONSE", Message: "sidecar returned invalid composite state", HTTPStatus: 200}
+	}
+	return nil
+}
+
+func (c *Client) compositePath(handle *CompositeHandle) string {
+	return "/extensions/composite-v1/composites/" + neturl.PathEscape(handle.OperationID)
+}
+
+func (c *Client) compositeBody(handle *CompositeHandle, extra map[string]any) map[string]any {
+	body := map[string]any{
+		"tenant_id": c.tenantID, "application_id": c.applicationID,
+		"owner_id": handle.OwnerID, "fence": handle.Fence,
+	}
+	for key, value := range extra {
+		body[key] = value
+	}
+	return body
+}
+
+func (c *Client) ClaimComposite(ctx context.Context, in ClaimCompositeRequest) (*CompositeReply, *CompositeHandle, error) {
+	body := map[string]any{
+		"tenant_id": c.tenantID, "application_id": c.applicationID,
+		"operation_id": in.OperationID, "definition": in.Definition, "steps": in.Steps,
+	}
+	if in.LeaseTTL != nil {
+		body["lease_ttl"] = *in.LeaseTTL
+	}
+	var out CompositeReply
+	if err := c.request(ctx, "claimComposite", http.MethodPost, "/extensions/composite-v1/composites/claim", body, &out, true); err != nil {
+		return nil, nil, err
+	}
+	if err := validateCompositeReply(&out); err != nil {
+		return nil, nil, err
+	}
+	if out.OwnerID == nil || *out.OwnerID == "" {
+		return nil, nil, &ProtocolError{Code: "INVALID_RESPONSE", Message: "composite claim lacks owner", HTTPStatus: 200}
+	}
+	return &out, &CompositeHandle{OperationID: out.OperationID, OwnerID: *out.OwnerID, Fence: out.Fence}, nil
+}
+
+func (c *Client) GetComposite(ctx context.Context, operationID string) (*CompositeReply, error) {
+	var out CompositeReply
+	err := c.request(ctx, "getComposite", http.MethodGet, "/extensions/composite-v1/composites/"+neturl.PathEscape(operationID), nil, &out, true)
+	if err == nil {
+		err = validateCompositeReply(&out)
+	}
+	return &out, err
+}
+
+func (c *Client) compositeCommand(ctx context.Context, handle *CompositeHandle, action string, extra map[string]any) (*CompositeReply, error) {
+	var out CompositeReply
+	err := c.request(ctx, action+"Composite", http.MethodPost, c.compositePath(handle)+"/"+action, c.compositeBody(handle, extra), &out, true)
+	if err == nil {
+		err = validateCompositeReply(&out)
+	}
+	return &out, err
+}
+
+func (c *Client) RenewComposite(ctx context.Context, handle *CompositeHandle, ttl *float64) (*CompositeReply, error) {
+	extra := map[string]any{}
+	if ttl != nil {
+		extra["lease_ttl"] = *ttl
+	}
+	return c.compositeCommand(ctx, handle, "renew", extra)
+}
+func (c *Client) ReleaseComposite(ctx context.Context, handle *CompositeHandle) (*CompositeReply, error) {
+	return c.compositeCommand(ctx, handle, "release", nil)
+}
+func (c *Client) FinishComposite(ctx context.Context, handle *CompositeHandle) (*CompositeReply, error) {
+	return c.compositeCommand(ctx, handle, "finish", nil)
+}
+
+func (c *Client) compositeStepPath(handle *CompositeHandle, stepID string, action string) string {
+	return c.compositePath(handle) + "/steps/" + neturl.PathEscape(stepID) + "/" + action
+}
+
+func (c *Client) ClaimCompositeStep(ctx context.Context, handle *CompositeHandle, stepID string, in ClaimEffectRequest) (*ClaimReply, error) {
+	in.IdentityRequest = c.identity(in.IdentityRequest)
+	extra := map[string]any{"identity": in.IdentityRequest}
+	if in.Decision != nil {
+		extra["decision"] = in.Decision
+	}
+	if in.LeaseTTL != nil {
+		extra["lease_ttl"] = *in.LeaseTTL
+	}
+	var raw map[string]any
+	if err := c.request(ctx, "claimCompositeStep", http.MethodPost, c.compositeStepPath(handle, stepID, "claim"), c.compositeBody(handle, extra), &raw, true); err != nil {
+		return nil, err
+	}
+	return decodeClaim(raw, in.IdentityRequest)
+}
+
+func (c *Client) compositeEffectCommand(ctx context.Context, handle *CompositeHandle, stepID string, effect *EffectHandle, action string, extra map[string]any) (*EffectReply, error) {
+	identity, err := requireIdentity(effect)
+	if err != nil {
+		return nil, err
+	}
+	extra["identity"] = c.identity(identity)
+	extra["effect_owner_id"] = effect.OwnerID
+	extra["effect_fence"] = effect.Fence
+	var out EffectReply
+	err = c.request(ctx, action+"CompositeStep", http.MethodPost, c.compositeStepPath(handle, stepID, action), c.compositeBody(handle, extra), &out, true)
+	if err == nil {
+		err = validateEffectReply(&out)
+	}
+	return &out, err
+}
+
+func (c *Client) BoundaryCompositeStep(ctx context.Context, handle *CompositeHandle, stepID string, effect *EffectHandle) (*EffectReply, error) {
+	return c.compositeEffectCommand(ctx, handle, stepID, effect, "boundary", map[string]any{})
+}
+func (c *Client) CompleteCompositeStep(ctx context.Context, handle *CompositeHandle, stepID string, effect *EffectHandle, result any) (*EffectReply, error) {
+	return c.compositeEffectCommand(ctx, handle, stepID, effect, "complete", map[string]any{"result": result})
+}
+func (c *Client) ResolveCompositeStep(ctx context.Context, handle *CompositeHandle, stepID string, identity IdentityRequest) (*CompositeReply, error) {
+	var out CompositeReply
+	err := c.request(ctx, "resolveCompositeStep", http.MethodPost, c.compositeStepPath(handle, stepID, "resolve"), c.compositeBody(handle, map[string]any{"identity": c.identity(identity)}), &out, true)
+	if err == nil {
+		err = validateCompositeReply(&out)
+	}
+	return &out, err
 }
 func mapTo(raw map[string]any, out any) error {
 	b, err := json.Marshal(raw)
