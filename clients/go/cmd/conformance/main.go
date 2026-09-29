@@ -128,6 +128,57 @@ func main() {
 	}
 	checks = append(checks, "claim-complete-replay")
 
+	manifest := mycelium.ClaimCompositeRequest{
+		OperationID: "conformance-go-composite", Definition: "publish-v1",
+		Steps: []mycelium.CompositeStep{
+			{StepID: "prepare", ToolID: "external_operation"},
+			{StepID: "publish", ToolID: "external_operation"},
+		},
+	}
+	_, firstParent, err := client.ClaimComposite(ctx, manifest)
+	if err != nil {
+		panic(err)
+	}
+	firstIdentity := identity("conformance-go-composite-prepare", tenant, application)
+	firstStep := must(client.ClaimCompositeStep(ctx, firstParent, "prepare", mycelium.ClaimEffectRequest{
+		IdentityRequest: firstIdentity, Decision: decision,
+	}))
+	if firstStep.Disposition != mycelium.ClaimExecute || firstStep.Handle == nil {
+		panic("composite first step did not execute")
+	}
+	must(client.BoundaryCompositeStep(ctx, firstParent, "prepare", firstStep.Handle))
+	must(client.CompleteCompositeStep(ctx, firstParent, "prepare", firstStep.Handle, map[string]any{"prepared": true}))
+	must(client.ReleaseComposite(ctx, firstParent))
+	_, resumedParent, err := client.ClaimComposite(ctx, manifest)
+	if err != nil {
+		panic(err)
+	}
+	if resumedParent.Fence <= firstParent.Fence {
+		panic("composite parent fence did not advance")
+	}
+	_, err = client.FinishComposite(ctx, firstParent)
+	requireProtocolError(err, "STALE_FENCE")
+	replayedStep := must(client.ClaimCompositeStep(ctx, resumedParent, "prepare", mycelium.ClaimEffectRequest{
+		IdentityRequest: firstIdentity, Decision: decision,
+	}))
+	if replayedStep.Disposition != mycelium.ClaimStoredResult || !reflect.DeepEqual(replayedStep.Result, map[string]any{"prepared": true}) {
+		panic("composite child did not replay stored result")
+	}
+	must(client.ResolveCompositeStep(ctx, resumedParent, "prepare", firstIdentity))
+	secondIdentity := identity("conformance-go-composite-publish", tenant, application)
+	secondStep := must(client.ClaimCompositeStep(ctx, resumedParent, "publish", mycelium.ClaimEffectRequest{
+		IdentityRequest: secondIdentity, Decision: decision,
+	}))
+	if secondStep.Disposition != mycelium.ClaimExecute || secondStep.Handle == nil {
+		panic("composite second step did not execute")
+	}
+	must(client.BoundaryCompositeStep(ctx, resumedParent, "publish", secondStep.Handle))
+	must(client.CompleteCompositeStep(ctx, resumedParent, "publish", secondStep.Handle, map[string]any{"published": true}))
+	if finished := must(client.FinishComposite(ctx, resumedParent)); finished.Status != "COMPLETED" {
+		panic("composite did not finish")
+	}
+	checks = append(checks, "composite-resume-fencing")
+
 	staleIdentity := identity("conformance-go-stale-fence", tenant, application)
 	staleClaim := must(client.ClaimEffect(ctx, mycelium.ClaimEffectRequest{
 		IdentityRequest: staleIdentity, Decision: decision,

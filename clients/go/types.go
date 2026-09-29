@@ -152,6 +152,33 @@ type ClaimReply struct {
 	Disposition ClaimDisposition `json:"disposition"`
 	Handle      *EffectHandle    `json:"-"`
 }
+type CompositeStep struct {
+	StepID string `json:"step_id"`
+	ToolID string `json:"tool_id"`
+}
+type ClaimCompositeRequest struct {
+	OperationID string          `json:"operation_id"`
+	Definition  string          `json:"definition"`
+	Steps       []CompositeStep `json:"steps"`
+	LeaseTTL    *float64        `json:"lease_ttl,omitempty"`
+}
+type CompositeReply struct {
+	ProtocolVersion ProtocolVersion           `json:"protocol_version"`
+	OperationID     string                    `json:"operation_id"`
+	Definition      string                    `json:"definition"`
+	ManifestDigest  string                    `json:"manifest_digest"`
+	Status          string                    `json:"status"`
+	OwnerID         *OwnerID                  `json:"owner_id"`
+	Fence           Fence                     `json:"fence"`
+	LeaseUntil      *float64                  `json:"lease_until"`
+	NextStep        int                       `json:"next_step"`
+	Children        map[string]map[string]any `json:"children"`
+}
+type CompositeHandle struct {
+	OperationID string
+	OwnerID     OwnerID
+	Fence       Fence
+}
 type HealthReply struct {
 	Status          string          `json:"status"`
 	ProtocolVersion ProtocolVersion `json:"protocol_version"`
