@@ -68,10 +68,43 @@ SQLite, file, Redis, PostgreSQL, and in-process storage provide the
 composite-control capability. Redis and PostgreSQL persist parent records in
 their respective atomic state stores with revision-checked updates. Workers
 must use the same Redis key prefix or PostgreSQL ledger table and database to
-share parent authority. In-memory storage is useful for unit tests only. This
-API is Python-runtime-only: it is not exposed by the language-neutral sidecar,
-and the shared PostgreSQL sidecar profile does not provide composite
-orchestration.
+share parent authority. In-memory storage is useful for unit tests only. The
+Python decorator remains the only API that statically inspects a function
+body. The sidecar also offers an experimental `composite-v1` extension for
+explicitly declared straight-line manifests on file or shared PostgreSQL
+storage.
+
+## Language-neutral sidecar extension
+
+The extension is advertised in `GET /v1/capabilities` under
+`extensions.composite-v1`; it does not change the frozen `v1alpha1` effect
+routes. Claim a parent at `POST /extensions/composite-v1/composites/claim` with
+`operation_id`, a stable `definition`, and an ordered list of unique
+`{step_id, tool_id}` pairs. The sidecar pins the manifest and issues a parent
+owner and fence. A changed definition, step order, or tool blocks replay.
+
+For each step, call `.../steps/{step_id}/claim` with the parent owner/fence and
+the complete child identity and decision. Only `EXECUTE` permits the provider
+call. Before the provider boundary, call `.../boundary`; after success, call
+`.../complete`. These commands validate both the parent fence and the child
+effect fence. The sidecar derives each child effect identity from its ordinary
+identity fields plus the parent operation, definition, and step. Reusing the
+same tool input in another parent creates a distinct child effect.
+
+On resume, claim the same parent manifest. A completed child returns
+`RETURN_STORED_RESULT`; call `.../resolve` to acknowledge its evidence in the
+new replay, then continue with the next step. Finish the parent only after all
+children are committed and resolved. `.../renew` extends a long-running parent
+lease; `.../release` relinquishes it after a controlled interruption. An
+unexpected worker death leaves the lease for a later fenced reclaim. `UNKNOWN`
+and unresolved children remain blocked.
+
+The host must declare the full sequence before claiming and call only those
+steps in order. The sidecar cannot inspect TypeScript or Go program control
+flow and does not make arbitrary workflows transactional. Its explicit
+manifests use a separate namespace and cannot resume a Python `@composite`
+decorator invocation. A parent check just before a provider call cannot
+cancel an external request already sent.
 
 ## Decision record
 

@@ -1029,6 +1029,11 @@ the version. Additive fields are permitted only through the extension rules
 already defined by this revision; they cannot silently become identity-bearing
 or execution-authorizing.
 
+Composite parent orchestration is a separately negotiated experimental
+`composite-v1` extension under `/extensions/composite-v1/`. It does not add
+operations to the frozen `v1alpha1` operation list or change identity-v1
+canonicalization. See [composite recovery](../COMPOSITE_RECOVERY.md).
+
 * Negotiate a protocol version and feature capabilities before commands.
 * Additive fields are optional and ignored when unknown unless marked critical by
   an extension namespace.

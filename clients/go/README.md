@@ -80,6 +80,14 @@ not prove that state or provider execution remained unchanged. Inspect the effec
 before deciding what to do next. Provider calls outside this lifecycle bypass the
 protection.
 
+The optional `composite-v1` sidecar extension exposes `ClaimComposite`,
+`ClaimCompositeStep`, `BoundaryCompositeStep`, `CompleteCompositeStep`,
+`ResolveCompositeStep`, and `FinishComposite` for explicit straight-line
+manifests. Call `AssertCompositeCompatible` before using it. The host supplies
+a stable operation ID, definition, and ordered steps, renews the parent lease
+during long provider calls, and replays completed child results after a crash.
+See the [composite recovery guide](../../sdk/docs/COMPOSITE_RECOVERY.md).
+
 ## Types and errors
 
 `ClaimReply` validates all seven current dispositions and rejects unknown or missing

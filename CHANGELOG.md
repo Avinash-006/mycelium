@@ -5,6 +5,13 @@ small PyPI versions. Pre-release checklist: [sdk/docs/RELEASE.md](sdk/docs/RELEA
 
 ## Unreleased
 
+### Added
+
+- Expose explicit composite parent and child step recovery through a
+  `composite-v1` sidecar extension and TypeScript/Go clients. The extension
+  pins manifests, scopes child identities to the parent, checks both fences,
+  and replays completed children after a restart without changing `v1alpha1`.
+
 ## 1.38.5 (2026-09-28)
 
 ### Added

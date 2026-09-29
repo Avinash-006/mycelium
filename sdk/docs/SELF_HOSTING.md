@@ -174,6 +174,13 @@ not provide exactly-once provider execution, hostile-client protection,
 provider truth, or protection for calls that bypass Mycelium. Keep ambiguous
 provider outcomes blocked until they can be reconciled safely.
 
+The optional `composite-v1` extension shares the configured action-ledger
+storage for explicit parent manifests and child step recovery. It is advertised
+under `extensions` in the authenticated capabilities response. File-backed
+development and shared PostgreSQL sidecars can resume a parent after restart;
+long-running hosts must renew the parent lease. See
+[composite recovery](COMPOSITE_RECOVERY.md) for its sequence and limits.
+
 ## Verify the installation
 
 Repository contributors can run both conformance paths:
