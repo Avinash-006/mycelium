@@ -2,8 +2,9 @@ import { JsonTransport } from "./transport.js";
 import { MyceliumProtocolError } from "./errors.js";
 import type {
   BoundaryRequest, CapabilitiesReply, ClaimEffectRequest, ClaimReply, CompleteEffectRequest,
-  EffectHandle, EffectReply, FailEffectRequest, FencedRequest, HealthReply, IdentityReply,
-  IdentityRequest, ProviderReferenceRequest, ReconcileRequest,
+  ClaimCompositeRequest, CompositeHandle, CompositeReply, EffectHandle, EffectReply,
+  FailEffectRequest, FencedRequest, HealthReply, IdentityReply, IdentityRequest,
+  ProviderReferenceRequest, ReconcileRequest,
 } from "./types.js";
 
 export const PROTOCOL_VERSION = "v1alpha1" as const;
@@ -44,6 +45,25 @@ function projection(raw: Record<string, unknown>): EffectReply {
     providerBoundary: raw.provider_boundary as EffectReply["providerBoundary"] ?? null,
     providerOperationRef: typeof raw.provider_operation_ref === "string" ? raw.provider_operation_ref : null,
     result: raw.result as EffectReply["result"], decision: raw.decision as EffectReply["decision"], error: raw.error as string | null,
+  };
+}
+
+function compositeProjection(raw: Record<string, unknown>): CompositeReply {
+  if (raw.protocol_version !== PROTOCOL_VERSION || typeof raw.operation_id !== "string" ||
+      typeof raw.definition !== "string" || typeof raw.manifest_digest !== "string" ||
+      !/^[0-9a-f]{64}$/.test(raw.manifest_digest) ||
+      (raw.status !== "RUNNING" && raw.status !== "COMPLETED") ||
+      typeof raw.fence !== "number" || !Number.isSafeInteger(raw.fence) || raw.fence < 1 ||
+      typeof raw.next_step !== "number" || !Number.isSafeInteger(raw.next_step) ||
+      !raw.children || typeof raw.children !== "object" || Array.isArray(raw.children)) {
+    throw new MyceliumProtocolError("invalid composite response", { code: "INVALID_RESPONSE", httpStatus: 200 });
+  }
+  return {
+    protocolVersion: raw.protocol_version, operationId: raw.operation_id,
+    definition: raw.definition, manifestDigest: raw.manifest_digest,
+    status: raw.status, ownerId: typeof raw.owner_id === "string" ? raw.owner_id : null,
+    fence: raw.fence, leaseUntil: typeof raw.lease_until === "number" ? raw.lease_until : null,
+    nextStep: raw.next_step, children: raw.children as CompositeReply["children"],
   };
 }
 
@@ -99,5 +119,68 @@ export class MyceliumClient {
     const effect = projection(raw);
     if (raw.reconciliation !== "authoritative-engine-result") throw new MyceliumProtocolError("invalid reconciliation response", { code: "INVALID_RESPONSE", httpStatus: 200, effectId: effect.effectId });
     return effect;
+  }
+
+  private compositeBody(handle: CompositeHandle, extra: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      tenant_id: this.options.tenantId, application_id: this.options.applicationId,
+      owner_id: handle.ownerId, fence: handle.fence, ...extra,
+    };
+  }
+  private compositePath(handle: CompositeHandle): string {
+    return `/v1/composites/${encodeURIComponent(handle.operationId)}`;
+  }
+  async claimComposite(request: ClaimCompositeRequest): Promise<{ composite: CompositeReply; handle: CompositeHandle }> {
+    const raw = await this.transport.request<Record<string, unknown>>("POST", "/v1/composites/claim", {
+      tenant_id: this.options.tenantId, application_id: this.options.applicationId,
+      operation_id: request.operationId, definition: request.definition,
+      steps: request.steps.map(step => ({ step_id: step.stepId, tool_id: step.toolId })),
+      ...(request.leaseTtl === undefined ? {} : { lease_ttl: request.leaseTtl }),
+    });
+    const composite = compositeProjection(raw);
+    if (!composite.ownerId) throw new MyceliumProtocolError("composite claim lacks owner", { code: "INVALID_RESPONSE", httpStatus: 200 });
+    return { composite, handle: { operationId: composite.operationId, ownerId: composite.ownerId, fence: composite.fence } };
+  }
+  async getComposite(operationId: string): Promise<CompositeReply> {
+    return compositeProjection(await this.transport.request("GET", `/v1/composites/${encodeURIComponent(operationId)}`));
+  }
+  async renewComposite(handle: CompositeHandle, leaseTtl?: number): Promise<CompositeReply> {
+    return compositeProjection(await this.transport.request("POST", `${this.compositePath(handle)}/renew`,
+      this.compositeBody(handle, leaseTtl === undefined ? {} : { lease_ttl: leaseTtl })));
+  }
+  async releaseComposite(handle: CompositeHandle): Promise<CompositeReply> {
+    return compositeProjection(await this.transport.request("POST", `${this.compositePath(handle)}/release`, this.compositeBody(handle)));
+  }
+  async finishComposite(handle: CompositeHandle): Promise<CompositeReply> {
+    return compositeProjection(await this.transport.request("POST", `${this.compositePath(handle)}/finish`, this.compositeBody(handle)));
+  }
+  async claimCompositeStep(handle: CompositeHandle, stepId: string, request: ClaimEffectRequest): Promise<ClaimReply> {
+    const raw = await this.transport.request<Record<string, unknown>>("POST", `${this.compositePath(handle)}/steps/${encodeURIComponent(stepId)}/claim`,
+      this.compositeBody(handle, {
+        identity: wireIdentity(request, this.options),
+        ...(request.decision === undefined ? {} : { decision: request.decision }),
+        ...(request.leaseTtl === undefined ? {} : { lease_ttl: request.leaseTtl }),
+      }));
+    const effect = projection(raw);
+    const disposition = raw.disposition;
+    if (!["EXECUTE", "RETURN_STORED_RESULT", "WAIT_FOR_OWNER", "RECORD_DECISION", "UNKNOWN", "DENIED", "TERMINAL_ABORTED"].includes(String(disposition)))
+      throw new MyceliumProtocolError("invalid composite step disposition", { code: "INVALID_RESPONSE", httpStatus: 200 });
+    if (disposition === "EXECUTE") {
+      if (!effect.ownerId || effect.fence === null) throw new MyceliumProtocolError("composite step lacks effect authority", { code: "INVALID_RESPONSE", httpStatus: 200 });
+      return { ...effect, disposition, handle: { effectId: effect.effectId, ownerId: effect.ownerId, fence: effect.fence, identity: request } } as ClaimReply;
+    }
+    return { ...effect, disposition } as ClaimReply;
+  }
+  async boundaryCompositeStep(handle: CompositeHandle, stepId: string, effect: EffectHandle): Promise<EffectReply> {
+    return projection(await this.transport.request("POST", `${this.compositePath(handle)}/steps/${encodeURIComponent(stepId)}/boundary`,
+      this.compositeBody(handle, { identity: wireIdentity(effect.identity, this.options), effect_owner_id: effect.ownerId, effect_fence: effect.fence })));
+  }
+  async completeCompositeStep(handle: CompositeHandle, stepId: string, effect: EffectHandle, result: unknown): Promise<EffectReply> {
+    return projection(await this.transport.request("POST", `${this.compositePath(handle)}/steps/${encodeURIComponent(stepId)}/complete`,
+      this.compositeBody(handle, { identity: wireIdentity(effect.identity, this.options), effect_owner_id: effect.ownerId, effect_fence: effect.fence, result })));
+  }
+  async resolveCompositeStep(handle: CompositeHandle, stepId: string, identity: IdentityRequest): Promise<CompositeReply> {
+    return compositeProjection(await this.transport.request("POST", `${this.compositePath(handle)}/steps/${encodeURIComponent(stepId)}/resolve`,
+      this.compositeBody(handle, { identity: wireIdentity(identity, this.options) })));
   }
 }

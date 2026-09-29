@@ -86,3 +86,28 @@ export interface EffectHandle {
   /** Original identity candidate, retained only to satisfy the sidecar's request binding. */
   identity: IdentityRequest;
 }
+
+export interface CompositeStep { stepId: string; toolId: string }
+export interface ClaimCompositeRequest {
+  operationId: string;
+  definition: string;
+  steps: CompositeStep[];
+  leaseTtl?: number;
+}
+export interface CompositeReply {
+  protocolVersion: string;
+  operationId: string;
+  definition: string;
+  manifestDigest: string;
+  status: "RUNNING" | "COMPLETED";
+  ownerId: string | null;
+  fence: number;
+  leaseUntil: number | null;
+  nextStep: number;
+  children: JsonObject;
+}
+export interface CompositeHandle {
+  operationId: string;
+  ownerId: string;
+  fence: number;
+}
