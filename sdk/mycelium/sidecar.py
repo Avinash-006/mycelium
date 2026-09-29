@@ -1616,7 +1616,11 @@ class SidecarService:
                     raise SidecarError(
                         "CHILD_UNRESOLVED", "composite has unresolved child effects", status=409
                     )
-                store.finish(key, owner, fence, ids, ids, frozenset(ids))
+                store.finish(
+                    key, owner, fence, ids,
+                    tuple(record.get("replay_observed", [])),
+                    frozenset(record.get("replay_resolved", [])),
+                )
             elif step_id is not None:
                 step_rows = record["manifest"]["steps"]
                 index = next(

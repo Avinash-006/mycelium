@@ -136,3 +136,44 @@ def test_child_effect_identity_is_bound_to_parent_and_step(tmp_path) -> None:
     )
     assert child_a["effect_id"] != child_b["effect_id"]
     assert child_a["effect_id"] != service.derive(identity)["effect_id"]
+
+
+def test_resumed_parent_must_observe_and_resolve_stored_child_before_finish(tmp_path) -> None:
+    service = _service(tmp_path)
+    manifest = {**_manifest(), "steps": [{"step_id": "create", "tool_id": "create"}]}
+    parent = service.claim_composite(manifest)
+    identity = _identity("create")
+    child = service.composite_command(
+        "job-1", "claim", _command(
+            parent, identity=identity,
+            decision={"allowed": True, "verdicts": [], "denied_reasons": []},
+        ), "create"
+    )
+    handle = {"effect_owner_id": child["owner_id"], "effect_fence": child["fence"]}
+    service.composite_command(
+        "job-1", "boundary", _command(parent, identity=identity, **handle), "create"
+    )
+    service.composite_command(
+        "job-1", "complete", _command(
+            parent, identity=identity, result={"created": True}, **handle
+        ), "create"
+    )
+    service.composite_command("job-1", "release", _command(parent))
+
+    resumed = service.claim_composite(manifest)
+    with pytest.raises(SidecarError) as missing_observation:
+        service.composite_command("job-1", "finish", _command(resumed))
+    assert missing_observation.value.code == "DEFINITION_DRIFT"
+
+    replay = service.composite_command(
+        "job-1", "claim", _command(resumed, identity=identity), "create"
+    )
+    assert replay["disposition"] == "RETURN_STORED_RESULT"
+    with pytest.raises(SidecarError) as missing_resolution:
+        service.composite_command("job-1", "finish", _command(resumed))
+    assert missing_resolution.value.code == "DEFINITION_DRIFT"
+
+    service.composite_command(
+        "job-1", "resolve", _command(resumed, identity=identity), "create"
+    )
+    assert service.composite_command("job-1", "finish", _command(resumed))["status"] == "COMPLETED"
