@@ -24,6 +24,15 @@ from pathlib import Path
 from typing import Any
 
 from mycelium.action_ledger import ActionLedger
+from mycelium.composite import (
+    CompositeAuthorityError,
+    CompositeBusyError,
+    CompositeDefinitionDriftError,
+    CompositeManifest,
+    CompositeStep,
+    _ControlStore,
+    _owner,
+)
 from mycelium.decision import Decision
 from mycelium.ledger_storage import FileLedgerStorage
 from mycelium.outcome_emit import FileOutcomeStorage, OutcomeEmitter
@@ -34,6 +43,7 @@ from mycelium.transition import (
     SideEffectClass,
     ToolCapability,
     ToolTransitionBinding,
+    canonical_json,
 )
 
 PROTOCOL_VERSION = "v1alpha1"
@@ -614,6 +624,100 @@ def openapi_document() -> dict[str, Any]:
             "responses": response("EffectInspectionReply", "Effect inspection"),
         }
     }
+    schemas["CompositeStep"] = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["step_id", "tool_id"],
+        "properties": {"step_id": string(max_length=128), "tool_id": ref("ToolId")},
+    }
+    schemas["ClaimCompositeRequest"] = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["tenant_id", "application_id", "operation_id", "definition", "steps"],
+        "properties": {
+            "tenant_id": ref("TenantId"),
+            "application_id": ref("ApplicationId"),
+            "operation_id": string(max_length=128),
+            "definition": string(max_length=256),
+            "steps": {
+                "type": "array", "minItems": 1, "maxItems": 64,
+                "items": ref("CompositeStep"),
+            },
+            "lease_ttl": {"type": "number", "exclusiveMinimum": 0, "maximum": 3600},
+        },
+    }
+    schemas["CompositeCommandRequest"] = {
+        "type": "object",
+        "required": ["tenant_id", "application_id", "owner_id", "fence"],
+        "properties": {
+            "tenant_id": ref("TenantId"),
+            "application_id": ref("ApplicationId"),
+            **fenced_properties,
+            "lease_ttl": {"type": "number", "exclusiveMinimum": 0, "maximum": 3600},
+        },
+    }
+    schemas["CompositeStepCommandRequest"] = {
+        "allOf": [
+            ref("CompositeCommandRequest"),
+            {
+                "type": "object",
+                "required": ["identity"],
+                "properties": {
+                    "identity": ref("DeriveIdentityRequest"),
+                    "decision": ref("Decision"),
+                    "effect_owner_id": ref("OwnerId"),
+                    "effect_fence": ref("Fence"),
+                    "result": ref("JsonValue"),
+                },
+            },
+        ]
+    }
+    schemas["CompositeReply"] = {
+        "type": "object",
+        "required": [
+            "protocol_version", "operation_id", "definition", "manifest_digest", "status",
+            "owner_id", "fence", "lease_until", "next_step", "children",
+        ],
+        "properties": {
+            "protocol_version": ref("ProtocolVersion"),
+            "operation_id": string(max_length=128),
+            "definition": string(max_length=256),
+            "manifest_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "status": {"enum": ["RUNNING", "COMPLETED"]},
+            "owner_id": {"anyOf": [ref("OwnerId"), {"type": "null"}]},
+            "fence": ref("Fence"),
+            "lease_until": {"type": ["number", "null"]},
+            "next_step": {"type": "integer", "minimum": 0},
+            "children": {"type": "object", "additionalProperties": ref("JsonObject")},
+        },
+    }
+    paths["/v1/composites/claim"] = post(
+        "ClaimCompositeRequest", "CompositeReply", "claimComposite"
+    )
+    paths["/v1/composites/{operation_id}"] = {
+        "get": {
+            "operationId": "getComposite",
+            "summary": "Inspect a composite parent",
+            "security": [{"bearerAuth": []}],
+            "parameters": [{
+                "name": "operation_id", "in": "path", "required": True,
+                "schema": string(max_length=128),
+            }],
+            "responses": response("CompositeReply", "Composite inspection"),
+        }
+    }
+    for action in ("renew", "release", "finish"):
+        paths[f"/v1/composites/{{operation_id}}/{action}"] = post(
+            "CompositeCommandRequest", "CompositeReply", f"{action}Composite"
+        )
+    for action in ("claim", "boundary", "complete", "resolve"):
+        paths[f"/v1/composites/{{operation_id}}/steps/{{step_id}}/{action}"] = post(
+            "CompositeStepCommandRequest",
+            "CompositeReply" if action == "resolve" else (
+                "ClaimEffectReply" if action == "claim" else "EffectInspectionReply"
+            ),
+            f"{action}CompositeStep",
+        )
     schemas["ReconcileEffectReply"] = {
         "allOf": [
             ref("EffectInspectionReply"),
@@ -1109,21 +1213,19 @@ class SidecarConfig:
         if not isinstance(data, dict) or data.get("kind") != "mycelium-sidecar":
             raise ValueError("sidecar config kind must be mycelium-sidecar")
         token_files = data.get("bearer_token_files", [data.get("bearer_token_file")])
-        if not isinstance(token_files, list) or not token_files or any(
-            not isinstance(item, str) or not Path(item).is_absolute() for item in token_files
+        if (
+            not isinstance(token_files, list)
+            or not token_files
+            or any(
+                not isinstance(item, str) or not Path(item).is_absolute() for item in token_files
+            )
         ):
             raise ValueError("bearer_token_files must contain absolute paths")
         ledger = data.get("ledger")
         outcome = data.get("outcome_storage")
-        if (
-            not isinstance(ledger, dict)
-            or ledger.get("type") not in {"file", "postgres"}
-        ):
+        if not isinstance(ledger, dict) or ledger.get("type") not in {"file", "postgres"}:
             raise ValueError("a file ledger path is required for the prototype")
-        if (
-            not isinstance(outcome, dict)
-            or outcome.get("type") not in {"file", "postgres"}
-        ):
+        if not isinstance(outcome, dict) or outcome.get("type") not in {"file", "postgres"}:
             raise ValueError("a file outcome path is required for the prototype")
         if ledger.get("type") == "file" and (
             not isinstance(ledger.get("path"), str) or not Path(ledger["path"]).is_absolute()
@@ -1139,11 +1241,11 @@ class SidecarConfig:
         database = data.get("database", {})
         if not isinstance(database, dict):
             raise ValueError("database configuration must be an object")
-        database_url = ledger.get("url") or ledger.get("dsn") or os.environ.get(
-            ledger.get("url_env", "")
+        database_url = (
+            ledger.get("url") or ledger.get("dsn") or os.environ.get(ledger.get("url_env", ""))
         )
-        outcome_url = outcome.get("url") or outcome.get("dsn") or os.environ.get(
-            outcome.get("url_env", "")
+        outcome_url = (
+            outcome.get("url") or outcome.get("dsn") or os.environ.get(outcome.get("url_env", ""))
         )
         return cls(
             host=values.get("host", "127.0.0.1"),
@@ -1296,6 +1398,15 @@ class SidecarService:
                 "complete_effect",
                 "fail_effect",
                 "request_reconciliation",
+                "claim_composite",
+                "inspect_composite",
+                "renew_composite",
+                "release_composite",
+                "finish_composite",
+                "claim_composite_step",
+                "boundary_composite_step",
+                "complete_composite_step",
+                "resolve_composite_step",
             ],
             "development_only": True,
         }
@@ -1319,6 +1430,231 @@ class SidecarService:
             retry_permission=RetryPermission.MANUAL_RECONCILIATION_REQUIRED,
             capability=ToolCapability.BLIND,
         )
+
+    def _composite_store(self) -> _ControlStore:
+        return _ControlStore(self.ledger._storage)
+
+    def _composite_key(self, operation_id: Any) -> str:
+        if not isinstance(operation_id, str) or not re.fullmatch(
+            r"[A-Za-z0-9._-]{1,128}", operation_id
+        ):
+            raise SidecarError("INVALID_REQUEST", "invalid composite operation_id")
+        return f"sidecar:{self.config.tenant_id}:{self.config.application_id}:{operation_id}"
+
+    def _composite_manifest(self, body: dict[str, Any]) -> CompositeManifest:
+        if (
+            body.get("tenant_id") != self.config.tenant_id
+            or body.get("application_id") != self.config.application_id
+        ):
+            raise SidecarError(
+                "TENANT_MISMATCH", "composite tenant or application mismatch", status=403
+            )
+        definition = body.get("definition")
+        steps = body.get("steps")
+        if not isinstance(definition, str) or not definition or len(definition.encode()) > 256:
+            raise SidecarError("INVALID_REQUEST", "composite definition is required")
+        if not isinstance(steps, list) or not 1 <= len(steps) <= 64:
+            raise SidecarError("INVALID_REQUEST", "composite requires 1 to 64 declared steps")
+        parsed: list[CompositeStep] = []
+        seen: set[str] = set()
+        for item in steps:
+            if not isinstance(item, dict) or set(item) != {"step_id", "tool_id"}:
+                raise SidecarError(
+                    "INVALID_REQUEST", "each composite step needs step_id and tool_id"
+                )
+            step_id, tool_id = item["step_id"], item["tool_id"]
+            if (
+                not isinstance(step_id, str)
+                or not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", step_id)
+                or step_id in seen
+                or not isinstance(tool_id, str)
+                or not tool_id
+                or len(tool_id.encode()) > 256
+            ):
+                raise SidecarError("INVALID_REQUEST", "invalid or duplicate composite step")
+            seen.add(step_id)
+            parsed.append(CompositeStep(step_id, tool_id, step_id, "sidecar-effect-v1"))
+        payload = {
+            "function": f"sidecar:{self.config.application_id}",
+            "definition": definition,
+            "steps": [step.to_dict() for step in parsed],
+        }
+        digest = hashlib.sha256(canonical_json(payload).encode()).hexdigest()
+        return CompositeManifest(payload["function"], definition, tuple(parsed), digest)
+
+    @staticmethod
+    def _composite_ttl(body: dict[str, Any]) -> float:
+        value = body.get("lease_ttl", 30.0)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or not 0 < value <= 3600
+        ):
+            raise SidecarError(
+                "INVALID_REQUEST", "composite lease_ttl must be finite and in (0, 3600]"
+            )
+        return float(value)
+
+    def claim_composite(self, body: dict[str, Any]) -> dict[str, Any]:
+        key = self._composite_key(body.get("operation_id"))
+        manifest = self._composite_manifest(body)
+        ttl = self._composite_ttl(body)
+        store = self._composite_store()
+        try:
+            store.create_or_load(key, manifest, key.rsplit(":", 1)[0])
+            record = store.acquire(key, _owner(), ttl)
+        except CompositeBusyError as exc:
+            raise SidecarError(
+                "ACTIVE_OWNER", "composite has a live owner", status=409, retryable=True
+            ) from exc
+        except CompositeDefinitionDriftError as exc:
+            raise SidecarError(
+                "DEFINITION_DRIFT", "composite definition changed", status=409
+            ) from exc
+        return self._composite_projection(record)
+
+    def get_composite(self, operation_id: str) -> dict[str, Any]:
+        record = self._composite_store().load(self._composite_key(operation_id))
+        if record is None:
+            raise SidecarError("NOT_FOUND", "composite not found", status=404)
+        return self._composite_projection(record)
+
+    def _composite_projection(self, record: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "protocol_version": self.config.protocol_version,
+            "operation_id": record["operation_id"].rsplit(":", 1)[-1],
+            "definition": record["definition"],
+            "manifest_digest": record["manifest_digest"],
+            "status": record["status"],
+            "owner_id": record["owner"],
+            "fence": record["fence"],
+            "lease_until": record["lease_until"],
+            "next_step": record["next_step"],
+            "children": record["children"],
+        }
+
+    def composite_command(
+        self, operation_id: str, action: str, body: dict[str, Any], step_id: str | None = None
+    ) -> dict[str, Any]:
+        key = self._composite_key(operation_id)
+        if (
+            body.get("tenant_id") != self.config.tenant_id
+            or body.get("application_id") != self.config.application_id
+        ):
+            raise SidecarError(
+                "TENANT_MISMATCH", "composite tenant or application mismatch", status=403
+            )
+        owner, fence = body.get("owner_id"), body.get("fence")
+        if (
+            not isinstance(owner, str)
+            or not owner
+            or isinstance(fence, bool)
+            or not isinstance(fence, int)
+            or fence <= 0
+        ):
+            raise SidecarError(
+                "INVALID_REQUEST", "composite owner_id and positive fence are required"
+            )
+        store = self._composite_store()
+        record = store.load(key)
+        if record is None:
+            raise SidecarError("NOT_FOUND", "composite not found", status=404)
+        if record["owner"] != owner or record["fence"] != fence:
+            raise SidecarError("STALE_FENCE", "composite parent authority was lost", status=409)
+        ttl = self._composite_ttl(body)
+        try:
+            if action == "renew":
+                store.renew(key, owner, fence, ttl)
+            elif action == "release":
+                store.release(key, owner, fence)
+            elif action == "finish":
+                steps = record["manifest"]["steps"]
+                ids = tuple(step["step_id"] for step in steps)
+                children = record["children"]
+                if any(
+                    children.get(sid, {}).get("outcome") != "COMPLETED"
+                    or (entry := self.ledger.get(children[sid]["effect_id"])) is None
+                    or entry.resolved_effect_state().value != "COMMITTED"
+                    for sid in ids
+                ):
+                    raise SidecarError(
+                        "CHILD_UNRESOLVED", "composite has unresolved child effects", status=409
+                    )
+                store.finish(key, owner, fence, ids, ids, frozenset(ids))
+            elif step_id is not None:
+                step_rows = record["manifest"]["steps"]
+                index = next(
+                    (i for i, row in enumerate(step_rows) if row["step_id"] == step_id), None
+                )
+                if index is None:
+                    raise SidecarError("NOT_FOUND", "composite step not found", status=404)
+                if any(
+                    record["children"].get(row["step_id"], {}).get("outcome") != "COMPLETED"
+                    for row in step_rows[:index]
+                ):
+                    raise SidecarError(
+                        "CHILD_UNRESOLVED", "previous composite step is unresolved", status=409
+                    )
+                step = CompositeStep(**step_rows[index])
+                identity = body.get("identity")
+                if not isinstance(identity, dict) or identity.get("tool_id") != step.tool:
+                    raise SidecarError(
+                        "INVALID_REQUEST", "step identity tool does not match manifest"
+                    )
+                canonical, effect_id = self._identity(identity)
+                binding = {
+                    "effect_id": effect_id,
+                    "args_fingerprint": hashlib.sha256(canonical.encode()).hexdigest(),
+                    "destination": hashlib.sha256(
+                        canonical_json(identity["destination"]).encode()
+                    ).hexdigest(),
+                }
+                if action == "claim":
+                    store.admit(key, owner, fence, step, binding, ttl)
+                    return self.claim(
+                        {**identity, **{k: body[k] for k in ("decision", "lease_ttl") if k in body}}
+                    )
+                child = record["children"].get(step_id)
+                if child is None or any(child.get(k) != v for k, v in binding.items()):
+                    raise SidecarError(
+                        "DEFINITION_DRIFT", "composite child binding changed", status=409
+                    )
+                if action == "resolve":
+                    entry = self.ledger.get(effect_id)
+                    if entry is None or entry.resolved_effect_state().value != "COMMITTED":
+                        raise SidecarError(
+                            "CHILD_UNRESOLVED", "child effect is not committed", status=409
+                        )
+                    store.resolve_child(key, owner, fence, step)
+                elif action in {"boundary", "complete"}:
+                    store.boundary(key, owner, fence, ttl)
+                    effect_owner, effect_fence = (
+                        body.get("effect_owner_id"),
+                        body.get("effect_fence"),
+                    )
+                    command = {**identity, "owner_id": effect_owner, "fence": effect_fence}
+                    if action == "boundary":
+                        command["boundary"] = "maybe_crossed"
+                    else:
+                        command["result"] = body.get("result")
+                    result = self.effect_command(action, command, effect_id)
+                    if action == "complete":
+                        store.resolve_child(key, owner, fence, step)
+                    return result
+                else:
+                    raise SidecarError("NOT_FOUND", "composite operation not found", status=404)
+            else:
+                raise SidecarError("NOT_FOUND", "composite operation not found", status=404)
+        except CompositeAuthorityError as exc:
+            raise SidecarError(
+                "STALE_FENCE", "composite parent authority was lost", status=409
+            ) from exc
+        except CompositeDefinitionDriftError as exc:
+            raise SidecarError(
+                "DEFINITION_DRIFT", "composite child or manifest changed", status=409
+            ) from exc
+        return self._composite_projection(store.load(key) or record)
 
     def claim(self, body: dict[str, Any]) -> dict[str, Any]:
         # The development profile runs one sidecar process. Serialize its
@@ -1416,8 +1752,10 @@ class SidecarService:
                         "disposition": "WAIT_FOR_OWNER",
                         **_projection(current),
                     }
-                entry = peer if outcome == "completed" and peer is not None else (
-                    self.ledger.get(effect_id) or candidate
+                entry = (
+                    peer
+                    if outcome == "completed" and peer is not None
+                    else (self.ledger.get(effect_id) or candidate)
                 )
             else:
                 entry = self.ledger.claim_side_effecting(
@@ -1610,8 +1948,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             raise SidecarError("AUTHENTICATION_REQUIRED", "bearer token required", status=401)
         supplied = header[7:]
         if not supplied or not any(
-            hmac.compare_digest(supplied, token)
-            for token in self._service().config.bearer_tokens
+            hmac.compare_digest(supplied, token) for token in self._service().config.bearer_tokens
         ):
             raise SidecarError("AUTHENTICATION_INVALID", "invalid bearer token", status=401)
 
@@ -1693,6 +2030,12 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             if path == "/v1/openapi.json":
                 self._reply(openapi_document())
                 return
+            if path.startswith("/v1/composites/"):
+                parts = path.strip("/").split("/")
+                if len(parts) != 3:
+                    raise SidecarError("NOT_FOUND", "endpoint not found", status=404)
+                self._reply(self._service().get_composite(_effect_path_segment(parts[2])))
+                return
             if path.startswith("/v1/effects/"):
                 effect_id = _effect_path_segment(path.rsplit("/", 1)[-1])
                 if not effect_id.startswith("mycelium:effect:v1:"):
@@ -1753,6 +2096,29 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             path = urllib.parse.urlsplit(self.path).path
             if path == "/v1/identities/derive":
                 result = self._service().derive(body)
+                status = 200
+            elif path == "/v1/composites/claim":
+                result = self._service().claim_composite(body)
+                status = 200
+            elif path.startswith("/v1/composites/"):
+                parts = path.strip("/").split("/")
+                if len(parts) == 4 and parts[3] in {"renew", "release", "finish"}:
+                    result = self._service().composite_command(
+                        _effect_path_segment(parts[2]), parts[3], body
+                    )
+                elif (
+                    len(parts) == 6
+                    and parts[3] == "steps"
+                    and parts[5] in {"claim", "boundary", "complete", "resolve"}
+                ):
+                    result = self._service().composite_command(
+                        _effect_path_segment(parts[2]),
+                        parts[5],
+                        body,
+                        _effect_path_segment(parts[4]),
+                    )
+                else:
+                    raise SidecarError("NOT_FOUND", "endpoint not found", status=404)
                 status = 200
             elif path == "/v1/effects/claim":
                 result = self._service().claim(body)

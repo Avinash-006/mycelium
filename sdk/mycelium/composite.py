@@ -398,6 +398,20 @@ class _ControlStore:
         assert self._lock is not None
         return self._lock.read_modify_write(fn)
 
+    def load(self, key: str) -> dict[str, Any] | None:
+        """Read a parent record without changing its revision or lease."""
+        if self._atomic is not None:
+            value = self._atomic.get(key)
+            return dict(value) if value is not None else None
+        if self._memory is not None:
+            with self._memory_lock:
+                value = self._memory.get(key)
+                return json.loads(json.dumps(value)) if value is not None else None
+        assert self._lock is not None
+        return self._lock.read_modify_write_no_save(
+            lambda data: json.loads(json.dumps(data[key])) if key in data else None
+        )
+
     def create_or_load(self, key: str, manifest: CompositeManifest, namespace: str) -> dict[str, Any]:
         def mutate(data: dict[str, Any]) -> dict[str, Any]:
             current = data.get(key)
