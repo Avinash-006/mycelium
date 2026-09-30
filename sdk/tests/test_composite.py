@@ -22,6 +22,7 @@ from mycelium import (
     SqliteLedgerStorage,
     ToolTransitionBinding,
     composite,
+    composite_choice,
     ledger,
     ledger_sync,
     register_composite_helper,
@@ -195,6 +196,243 @@ def test_composite_branch_requires_immutable_boolean_argument(tmp_path) -> None:
             else:
                 result = effect(idempotency_key="b")
             return result
+
+
+def test_child_result_branch_persists_choice_and_replays(tmp_path) -> None:
+    storage = SqliteLedgerStorage(tmp_path / "ledger.sqlite")
+    calls: list[str] = []
+    crash = {"enabled": True}
+
+    @ledger_sync(storage=storage, transition_binding=_binding())
+    def check(idempotency_key: str) -> bool:
+        with side_effect():
+            calls.append("check")
+        return True
+
+    @ledger_sync(storage=storage, transition_binding=_binding())
+    def approve(idempotency_key: str) -> str:
+        with side_effect():
+            calls.append("approve")
+        return "approved"
+
+    @ledger_sync(storage=storage, transition_binding=_binding())
+    def deny(idempotency_key: str) -> str:
+        with side_effect():
+            calls.append("deny")
+        return "denied"
+
+    @ledger_sync(storage=storage, transition_binding=_binding())
+    def record(idempotency_key: str, result: str) -> str:
+        with side_effect():
+            calls.append("record")
+        return result
+
+    def crash_after_branch() -> None:
+        if crash["enabled"]:
+            raise RuntimeError("simulated crash")
+
+    register_composite_helper(crash_after_branch)
+
+    @composite(storage)
+    def decide(operation_id: str) -> str:
+        allowed = check(idempotency_key="check")
+        if composite_choice(allowed):
+            result = approve(idempotency_key="approve")
+        else:
+            result = deny(idempotency_key="deny")
+        crash_after_branch()
+        return record(idempotency_key="record", result=result)
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        decide(operation_id="job-1")
+    assert calls == ["check", "approve"]
+    controls = json.loads((tmp_path / "ledger.sqlite.composites.json").read_text())
+    assert controls["mycelium:job-1"]["selected_manifest"]["path"] == "result:allowed:then"
+
+    store = _ControlStore(storage)
+    key = "mycelium:job-1"
+    contender = store.acquire(key, "replay-owner", 10)
+    prefix_step = decide._mycelium_composite_manifest.steps[0]
+    prefix_ids = (prefix_step.step_id,)
+    binding = dict(store.load(key)["children"][prefix_step.step_id])
+    binding.pop("outcome")
+    store.admit(key, "replay-owner", contender["fence"], prefix_step, binding, 10)
+    store.resolve_child(key, "replay-owner", contender["fence"], prefix_step)
+    with pytest.raises(CompositeDefinitionDriftError, match="choice changed"):
+        store.pin_result_path(
+            key, "replay-owner", contender["fence"],
+            decide._mycelium_composite_manifests[False], prefix_ids,
+        )
+    store.release(key, "replay-owner", contender["fence"])
+
+    crash["enabled"] = False
+    assert decide(operation_id="job-1") == "approved"
+    assert calls == ["check", "approve", "record"]
+    assert decide(operation_id="job-1") == "approved"
+    assert calls == ["check", "approve", "record"]
+
+
+def test_child_result_branch_rejects_non_boolean_and_unbound_selector(tmp_path) -> None:
+    storage = SqliteLedgerStorage(tmp_path / "ledger.sqlite")
+    calls: list[str] = []
+
+    @ledger_sync(storage=storage, transition_binding=_binding())
+    def check(idempotency_key: str) -> str:
+        with side_effect():
+            calls.append("check")
+        return "yes"
+
+    @ledger_sync(storage=storage, transition_binding=_binding())
+    def act(idempotency_key: str) -> str:
+        with side_effect():
+            calls.append("act")
+        return "done"
+
+    @composite(storage)
+    def decide(operation_id: str) -> str:
+        allowed = check(idempotency_key="check")
+        if composite_choice(allowed):
+            result = act(idempotency_key="yes")
+        else:
+            result = act(idempotency_key="no")
+        return result
+
+    with pytest.raises(CompositeUnsupportedError, match="bool child result"):
+        decide(operation_id="job-1")
+    assert calls == ["check"]
+
+    with pytest.raises(CompositeUnsupportedError, match="preceding child result"):
+
+        @composite(storage)
+        def unbound(operation_id: str, allowed: bool) -> str:
+            if composite_choice(allowed):
+                result = act(idempotency_key="yes")
+            else:
+                result = act(idempotency_key="no")
+            return result
+
+
+def test_child_result_choice_survives_crash_before_branch_effect(tmp_path) -> None:
+    storage = SqliteLedgerStorage(tmp_path / "ledger.sqlite")
+    calls: list[str] = []
+    crash = {"enabled": True}
+
+    @ledger_sync(storage=storage, transition_binding=_binding())
+    def check(idempotency_key: str) -> bool:
+        with side_effect():
+            calls.append("check")
+        return False
+
+    @ledger_sync(storage=storage, transition_binding=_binding())
+    def act(idempotency_key: str) -> str:
+        with side_effect():
+            calls.append(idempotency_key)
+        return idempotency_key
+
+    def pause() -> None:
+        if crash["enabled"]:
+            raise RuntimeError("after choice")
+
+    register_composite_helper(pause)
+
+    @composite(storage)
+    def decide(operation_id: str) -> str:
+        allowed = check(idempotency_key="check")
+        if composite_choice(allowed):
+            result = act(idempotency_key="approved")
+        else:
+            pause()
+            result = act(idempotency_key="denied")
+        return result
+
+    with pytest.raises(RuntimeError, match="after choice"):
+        decide(operation_id="job-1")
+    assert calls == ["check"]
+    controls = json.loads((tmp_path / "ledger.sqlite.composites.json").read_text())
+    assert controls["mycelium:job-1"]["selected_manifest"]["path"] == "result:allowed:else"
+
+    crash["enabled"] = False
+    assert decide(operation_id="job-1") == "denied"
+    assert calls == ["check", "denied"]
+
+
+def test_result_branch_definitions_are_pinned_before_first_child(tmp_path) -> None:
+    storage = SqliteLedgerStorage(tmp_path / "ledger.sqlite")
+    calls: list[str] = []
+
+    @ledger_sync(storage=storage, transition_binding=_binding())
+    def check(idempotency_key: str) -> bool:
+        with side_effect():
+            calls.append("check")
+        return True
+
+    @ledger_sync(storage=storage, transition_binding=_binding())
+    def first(idempotency_key: str) -> str:
+        with side_effect():
+            calls.append("first")
+        return "first"
+
+    @ledger_sync(storage=storage, transition_binding=_binding())
+    def second(idempotency_key: str) -> str:
+        with side_effect():
+            calls.append("second")
+        return "second"
+
+    @composite(storage, definition="pinned")
+    def workflow(operation_id: str) -> str:
+        allowed = check(idempotency_key="check")
+        if composite_choice(allowed):
+            result = first(idempotency_key="first")
+        else:
+            result = second(idempotency_key="second")
+        return result
+
+    _ControlStore(storage).create_or_load(
+        "mycelium:job-1", workflow._mycelium_composite_manifest, "mycelium"
+    )
+
+    @composite(storage, definition="pinned")
+    def workflow(operation_id: str) -> str:
+        allowed = check(idempotency_key="check")
+        if composite_choice(allowed):
+            result = second(idempotency_key="changed")
+        else:
+            result = first(idempotency_key="changed")
+        return result
+
+    with pytest.raises(CompositeDefinitionDriftError, match="manifest drift"):
+        workflow(operation_id="job-1")
+    assert calls == []
+
+
+def test_async_child_result_branch_uses_stored_boolean(tmp_path) -> None:
+    storage = SqliteLedgerStorage(tmp_path / "ledger.sqlite")
+    calls: list[str] = []
+
+    @ledger(storage=storage, transition_binding=_binding())
+    async def check(idempotency_key: str) -> bool:
+        async with side_effect_async():
+            calls.append("check")
+        return False
+
+    @ledger(storage=storage, transition_binding=_binding())
+    async def act(idempotency_key: str) -> str:
+        async with side_effect_async():
+            calls.append(idempotency_key)
+        return idempotency_key
+
+    @composite(storage)
+    async def decide(operation_id: str) -> str:
+        allowed = await check(idempotency_key="check")
+        if not composite_choice(allowed):
+            result = await act(idempotency_key="denied")
+        else:
+            result = await act(idempotency_key="approved")
+        return result
+
+    assert asyncio.run(decide(operation_id="async-branch")) == "denied"
+    assert asyncio.run(decide(operation_id="async-branch")) == "denied"
+    assert calls == ["check", "denied"]
 
 
 def test_composite_rejects_expression_control_flow_before_any_effect(tmp_path) -> None:
