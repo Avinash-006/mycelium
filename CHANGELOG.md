@@ -7,6 +7,9 @@ small PyPI versions. Pre-release checklist: [sdk/docs/RELEASE.md](sdk/docs/RELEA
 
 ### Added
 
+- Allow a Python composite to pin one branch from the immediately preceding
+  ledgered child's boolean result with `composite_choice()`, then replay that
+  choice before any branch effect.
 - Support one input-boolean `if`/`else` path in Python `@composite` workflows.
   Pin the selected path before child effects and reject changed choices on replay.
 - Expose explicit composite parent and child step recovery through a

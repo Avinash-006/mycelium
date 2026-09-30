@@ -82,6 +82,7 @@ class CompositeManifest:
     steps: tuple[CompositeStep, ...]
     digest: str
     path: str | None = None
+    alternatives: tuple[str, str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         result = {
@@ -92,6 +93,8 @@ class CompositeManifest:
         }
         if self.path is not None:
             result["path"] = self.path
+        if self.alternatives is not None:
+            result["alternatives"] = list(self.alternatives)
         return result
 
 
@@ -99,6 +102,16 @@ class CompositeManifest:
 class _PreparedChild:
     step_id: str
     effect_id: str
+
+
+@dataclass(frozen=True)
+class _BranchPaths:
+    selector: str
+    inverted: bool
+    prefix_body: list[ast.stmt]
+    then_body: list[ast.stmt]
+    else_body: list[ast.stmt]
+    from_result: bool
 
 
 def _owner() -> str:
@@ -269,29 +282,59 @@ def _straight_line_body(func: Callable[..., Any], parsed: ast.Module) -> list[as
 
 def _input_branch_paths(
     func: Callable[..., Any], parsed: ast.Module
-) -> tuple[str, bool, list[ast.stmt], list[ast.stmt]] | None:
+) -> _BranchPaths | None:
     body = _function_body(func, parsed)
     branches = [(index, stmt) for index, stmt in enumerate(body) if isinstance(stmt, ast.If)]
     if not branches:
         return None
     if len(branches) != 1:
-        raise CompositeUnsupportedError("composites support one top-level input boolean branch")
+        raise CompositeUnsupportedError("composites support one top-level boolean branch")
     branch_index, branch = branches[0]
     condition = branch.test
     inverted = isinstance(condition, ast.UnaryOp) and isinstance(condition.op, ast.Not)
     if inverted:
         condition = condition.operand
-    if not isinstance(condition, ast.Name) or condition.id not in inspect.signature(func).parameters:
-        raise CompositeUnsupportedError(
-            "composite branch condition must be a boolean function argument or its negation"
-        )
-    if any(
-        isinstance(node, ast.Name)
-        and node.id == condition.id
-        and isinstance(node.ctx, (ast.Store, ast.Del))
-        for statement in body for node in ast.walk(statement)
-    ):
-        raise CompositeUnsupportedError("composite branch argument cannot be reassigned")
+    from_result = isinstance(condition, ast.Call)
+    if from_result:
+        closure = inspect.getclosurevars(func)
+        namespace = {**closure.globals, **closure.nonlocals, **getattr(func, "__globals__", {})}
+        if (
+            _resolve_value(condition, namespace) is not composite_choice
+            or len(condition.args) != 1
+            or condition.keywords
+            or not isinstance(condition.args[0], ast.Name)
+            or branch_index == 0
+        ):
+            raise CompositeUnsupportedError(
+                "result branch must call composite_choice() on the preceding child result"
+            )
+        selector = condition.args[0].id
+        previous = body[branch_index - 1]
+        previous_call = _direct_call(previous)
+        if (
+            not isinstance(previous, ast.Assign)
+            or len(previous.targets) != 1
+            or not isinstance(previous.targets[0], ast.Name)
+            or previous.targets[0].id != selector
+            or previous_call is None
+            or _resolve_call(previous_call, namespace) is None
+        ):
+            raise CompositeUnsupportedError(
+                "composite_choice() requires an immediately preceding ledgered child assignment"
+            )
+    else:
+        if not isinstance(condition, ast.Name) or condition.id not in inspect.signature(func).parameters:
+            raise CompositeUnsupportedError(
+                "composite branch condition must be a boolean function argument or its negation"
+            )
+        selector = condition.id
+        if any(
+            isinstance(node, ast.Name)
+            and node.id == selector
+            and isinstance(node.ctx, (ast.Store, ast.Del))
+            for statement in body for node in ast.walk(statement)
+        ):
+            raise CompositeUnsupportedError("composite branch argument cannot be reassigned")
     for index, statement in enumerate(body):
         if index == branch_index:
             for arm_statement in (*branch.body, *branch.orelse):
@@ -302,10 +345,12 @@ def _input_branch_paths(
             _validate_statement(func, statement)
             if isinstance(statement, ast.Return) and index != len(body) - 1:
                 raise CompositeUnsupportedError("composite cannot return before its final statement")
-    return (
-        condition.id, inverted,
+    return _BranchPaths(
+        selector, inverted,
+        body[:branch_index],
         [*body[:branch_index], *branch.body, *body[branch_index + 1:]],
         [*body[:branch_index], *branch.orelse, *body[branch_index + 1:]],
+        from_result,
     )
 
 
@@ -338,6 +383,7 @@ def _direct_call(statement: ast.stmt) -> ast.Call | None:
 def _build_manifest(
     func: Callable[..., Any], definition: str | None,
     *, body: list[ast.stmt] | None = None, path: str | None = None,
+    alternatives: tuple[str, str] | None = None,
 ) -> CompositeManifest:
     try:
         source = inspect.getsource(inspect.unwrap(func))
@@ -400,8 +446,12 @@ def _build_manifest(
     }
     if path is not None:
         payload["path"] = path
+    if alternatives is not None:
+        payload["alternatives"] = list(alternatives)
     digest = hashlib.sha256(canonical_json(payload).encode()).hexdigest()
-    return CompositeManifest(payload["function"], payload["definition"], tuple(steps), digest, path)
+    return CompositeManifest(
+        payload["function"], payload["definition"], tuple(steps), digest, path, alternatives
+    )
 
 
 class _ControlStore:
@@ -532,6 +582,40 @@ class _ControlStore:
             rec["lease_until"] = time.time() + lease_ttl if lease_ttl > 0 else None
         self._mutate(key, mutate)
 
+    def pin_result_path(
+        self,
+        key: str,
+        owner: str,
+        fence: int,
+        manifest: CompositeManifest,
+        prefix_step_ids: tuple[str, ...],
+    ) -> None:
+        """Choose one prevalidated path after replaying its prerequisite children."""
+        def mutate(data: dict[str, Any]) -> None:
+            rec = data[key]
+            if rec.get("owner") != owner or int(rec.get("fence", -1)) != fence:
+                raise CompositeAuthorityError("lost parent authority before choosing a result path")
+            if (
+                tuple(rec.get("replay_observed", [])) != prefix_step_ids
+                or tuple(rec.get("replay_resolved", [])) != prefix_step_ids
+            ):
+                raise CompositeDefinitionDriftError(
+                    "current replay must resolve the prerequisite children before choosing a path"
+                )
+            base = rec["manifest"]
+            if manifest.digest not in base.get("alternatives", []):
+                raise CompositeDefinitionDriftError("result path was not pinned in the base manifest")
+            if tuple(step["step_id"] for step in base["steps"]) != prefix_step_ids:
+                raise CompositeDefinitionDriftError("result path prerequisite manifest changed")
+            if tuple(step.step_id for step in manifest.steps[:len(prefix_step_ids)]) != prefix_step_ids:
+                raise CompositeDefinitionDriftError("selected path does not preserve prerequisite steps")
+            selected = rec.get("selected_manifest")
+            if selected is not None and selected.get("digest") != manifest.digest:
+                raise CompositeDefinitionDriftError("result branch choice changed on replay")
+            if selected is None:
+                rec["selected_manifest"] = manifest.to_dict()
+        self._mutate(key, mutate)
+
     def admit(
         self,
         key: str,
@@ -546,7 +630,7 @@ class _ControlStore:
             if rec.get("owner") != owner or int(rec.get("fence", -1)) != fence:
                 raise CompositeAuthorityError(f"lost parent authority before admitting {step.step_id}")
             rec["lease_until"] = time.time() + lease_ttl
-            expected = rec["manifest"]["steps"]
+            expected = rec.get("selected_manifest", rec["manifest"])["steps"]
             index = next((i for i, item in enumerate(expected) if item["step_id"] == step.step_id), None)
             next_step = int(rec.get("next_step", 0))
             if index is None or index > next_step:
@@ -635,6 +719,11 @@ class _ControlStore:
                 raise CompositeDefinitionDriftError(
                     "durable current replay evidence is incomplete or out of order"
                 )
+            if rec["manifest"].get("path", "").endswith(":pending") and "selected_manifest" not in rec:
+                raise CompositeDefinitionDriftError("child-result branch was never selected")
+            selected = rec.get("selected_manifest", rec["manifest"])
+            if tuple(step["step_id"] for step in selected["steps"]) != expected_step_ids:
+                raise CompositeDefinitionDriftError("parent manifest path changed before completion")
             children = rec.get("children", {})
             if any(children.get(step_id, {}).get("outcome") != "COMPLETED" for step_id in expected_step_ids):
                 raise CompositeDefinitionDriftError(
@@ -664,6 +753,14 @@ def get_active_composite() -> CompositeInvocation | None:
     return _active_composite.get()
 
 
+def composite_choice(value: bool) -> bool:
+    """Persist a branch chosen from the immediately preceding child result."""
+    active = get_active_composite()
+    if active is None:
+        raise CompositeUnsupportedError("composite_choice() requires an active composite")
+    return active.select_result_path(value)
+
+
 class CompositeInvocation(AbstractContextManager["CompositeInvocation"]):
     def __init__(
         self,
@@ -674,6 +771,8 @@ class CompositeInvocation(AbstractContextManager["CompositeInvocation"]):
         namespace: str,
         lease_ttl: float,
         renewal_interval: float | None = None,
+        result_manifests: dict[bool, CompositeManifest] | None = None,
+        result_inverted: bool = False,
     ) -> None:
         if lease_ttl <= 0:
             raise CompositeUnsupportedError("composite lease_ttl must be positive")
@@ -682,6 +781,10 @@ class CompositeInvocation(AbstractContextManager["CompositeInvocation"]):
         self.store = _ControlStore(storage)
         self.key = f"{namespace}:{operation_id}"
         self.manifest = manifest
+        self.base_manifest = manifest
+        self.result_manifests = result_manifests
+        self.result_inverted = result_inverted
+        self._path_selected = False
         self.owner = _owner()
         self.lease_ttl = lease_ttl
         self.renewal_interval = renewal_interval
@@ -695,6 +798,28 @@ class CompositeInvocation(AbstractContextManager["CompositeInvocation"]):
         self._renew_stop = threading.Event()
         self._renew_thread: threading.Thread | None = None
         self._renewal_error: CompositeAuthorityError | None = None
+
+    def select_result_path(self, value: bool) -> bool:
+        if self.result_manifests is None:
+            raise CompositeUnsupportedError("this composite has no child-result branch")
+        if type(value) is not bool:
+            raise CompositeUnsupportedError("composite_choice() requires a bool child result")
+        if self._path_selected:
+            raise CompositeDefinitionDriftError("result branch was selected more than once")
+        prefix = tuple(step.step_id for step in self.base_manifest.steps)
+        if (
+            tuple(self.observed_steps) != prefix
+            or self.resolved_steps != set(prefix)
+            or self.cursor != len(prefix)
+        ):
+            raise CompositeDefinitionDriftError(
+                "result branch must follow its resolved prerequisite children"
+            )
+        selected = self.result_manifests[value != self.result_inverted]
+        self.store.pin_result_path(self.key, self.owner, self.fence, selected, prefix)
+        self.manifest = selected
+        self._path_selected = True
+        return value
 
     def _start_renewal(self) -> None:
         if (
@@ -843,7 +968,7 @@ def composite(
     lease_ttl: float = 3600.0,
     renewal_interval: float | None = None,
 ) -> Callable[[Callable[..., R]], Callable[..., R]]:
-    """Decorate an unchanged straight-line or input-boolean-branch function.
+    """Decorate an unchanged bounded composite function for child recovery.
 
     Child calls must be the actual callables wrapped by ``ledger`` or
     ``ledger_sync``.  ``operation_id_from`` must return the same logical ID on
@@ -861,16 +986,29 @@ def composite(
             manifest = _build_manifest(func, definition)
             branch_manifests = None
         else:
-            argument, _, then_body, else_body = branch_paths
+            argument = branch_paths.selector
+            mode = "result" if branch_paths.from_result else "input"
             branch_manifests = {
                 True: _build_manifest(
-                    func, definition, body=then_body, path=f"input:{argument}:then"
+                    func, definition, body=branch_paths.then_body,
+                    path=f"{mode}:{argument}:then",
                 ),
                 False: _build_manifest(
-                    func, definition, body=else_body, path=f"input:{argument}:else"
+                    func, definition, body=branch_paths.else_body,
+                    path=f"{mode}:{argument}:else",
                 ),
             }
-            manifest = None
+            manifest = (
+                _build_manifest(
+                    func, definition, body=branch_paths.prefix_body,
+                    path=f"result:{argument}:pending",
+                    alternatives=(
+                        branch_manifests[True].digest,
+                        branch_manifests[False].digest,
+                    ),
+                )
+                if branch_paths.from_result else None
+            )
 
         def operation_id(args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
             value = operation_id_from(args, kwargs) if operation_id_from else kwargs.get("operation_id")
@@ -891,11 +1029,11 @@ def composite(
             return kwargs
 
         def selected_manifest(args: tuple[Any, ...], kwargs: dict[str, Any]) -> CompositeManifest:
-            if branch_paths is None:
+            if branch_paths is None or branch_paths.from_result:
                 assert manifest is not None
                 return manifest
             assert branch_manifests is not None
-            argument, inverted, _, _ = branch_paths
+            argument, inverted = branch_paths.selector, branch_paths.inverted
             bound = inspect.signature(func).bind(*args, **call_kwargs(kwargs))
             bound.apply_defaults()
             value = bound.arguments.get(argument)
@@ -915,6 +1053,10 @@ def composite(
                     namespace=namespace,
                     lease_ttl=lease_ttl,
                     renewal_interval=renewal_interval,
+                    result_manifests=(
+                        branch_manifests if branch_paths is not None and branch_paths.from_result else None
+                    ),
+                    result_inverted=branch_paths.inverted if branch_paths is not None else False,
                 ):
                     result = await func(*args, **call_kwargs(kwargs))
                     active = get_active_composite()
@@ -923,7 +1065,7 @@ def composite(
                     return result
             if manifest is not None:
                 setattr(async_wrapper, "_mycelium_composite_manifest", manifest)
-            else:
+            if branch_manifests is not None:
                 setattr(async_wrapper, "_mycelium_composite_manifests", branch_manifests)
             return cast(Callable[..., R], async_wrapper)
 
@@ -936,6 +1078,10 @@ def composite(
                 namespace=namespace,
                 lease_ttl=lease_ttl,
                 renewal_interval=renewal_interval,
+                result_manifests=(
+                    branch_manifests if branch_paths is not None and branch_paths.from_result else None
+                ),
+                result_inverted=branch_paths.inverted if branch_paths is not None else False,
             ):
                 result = func(*args, **call_kwargs(kwargs))
                 active = get_active_composite()
@@ -944,7 +1090,7 @@ def composite(
                 return result
         if manifest is not None:
             setattr(sync_wrapper, "_mycelium_composite_manifest", manifest)
-        else:
+        if branch_manifests is not None:
             setattr(sync_wrapper, "_mycelium_composite_manifests", branch_manifests)
         return cast(Callable[..., R], sync_wrapper)
     return decorate
@@ -959,6 +1105,7 @@ __all__ = [
     "CompositeBusyError",
     "CompositeUnsupportedError",
     "composite",
+    "composite_choice",
     "get_active_composite",
     "register_composite_boundary",
     "register_composite_helper",
