@@ -39,13 +39,31 @@ is checked at admission and immediately before the child body and
 `mark_maybe_crossed()` boundary. This protects progression but cannot cancel
 an external request already sent during a check-to-send race.
 
-The initial scope is an explicit straight-line syntax subset: assignments,
-expression statements, and one final return, with each supported call at a
-statement boundary. Conditionals, short-circuit or conditional expressions,
-loops, comprehensions, generators, nested calls such as `outer(inner())`,
-early returns, nested definitions, recursion, dynamic dispatch, nested
-composites, and unsupported/opaque boundaries are rejected before execution.
-This avoids inferring order by sorting every AST call by source location.
+The Python decorator supports straight-line assignments, expression
+statements, and one final return, with each supported call at a statement
+boundary. It also supports one top-level `if`/`else` whose condition is a
+boolean function argument (`if enabled:` or `if not enabled:`). The argument
+must be an actual `bool` and cannot be reassigned. Both possible paths are
+checked at decoration time; the chosen path is pinned in the durable manifest
+before the first child effect. A retry with a different choice is rejected.
+Each path must contain at least one supported child boundary. For example:
+
+```python
+@composite(storage)
+def publish_or_hold(operation_id: str, publish: bool):
+    if publish:
+        decision = publish_change(idempotency_key=f"{operation_id}:publish")
+    else:
+        decision = record_hold(idempotency_key=f"{operation_id}:hold")
+    return record_decision(idempotency_key=f"{operation_id}:record", decision=decision)
+```
+
+Branches based on child results or mutable external facts, multiple or nested
+conditions, short-circuit or conditional expressions, loops, comprehensions,
+generators, nested calls such as `outer(inner())`, early returns, nested
+definitions, recursion, dynamic dispatch, nested composites, and
+unsupported/opaque boundaries are rejected before execution. This avoids
+inferring order by sorting every AST call by source location.
 Static analysis is preflight assistance, not proof that arbitrary hidden
 effects were found. Deterministic local computation may rerun, but time,
 randomness, mutable globals, fresh external reads, and other nondeterministic
@@ -111,5 +129,5 @@ cancel an external request already sent.
 The implementation chooses a lightweight durable parent-control record plus
 ordinary child `LedgerEntry` rows. `handoff_scope()` remains audit causation
 only. The parent is not an atomic transaction and never aggregates away child
-ambiguity. Straight-line support is intentional; general workflow scheduling
-and conditional-path manifests are deferred until enforceable semantics exist.
+ambiguity. General workflow scheduling and conditions based on prior child
+outcomes remain deferred.
