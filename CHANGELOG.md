@@ -7,6 +7,8 @@ small PyPI versions. Pre-release checklist: [sdk/docs/RELEASE.md](sdk/docs/RELEA
 
 ### Added
 
+- Support one input-boolean `if`/`else` path in Python `@composite` workflows.
+  Pin the selected path before child effects and reject changed choices on replay.
 - Expose explicit composite parent and child step recovery through a
   `composite-v1` sidecar extension and TypeScript/Go clients. The extension
   pins manifests, scopes child identities to the parent, checks both fences,
