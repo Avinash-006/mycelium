@@ -58,12 +58,38 @@ def publish_or_hold(operation_id: str, publish: bool):
     return record_decision(idempotency_key=f"{operation_id}:record", decision=decision)
 ```
 
-Branches based on child results or mutable external facts, multiple or nested
-conditions, short-circuit or conditional expressions, loops, comprehensions,
-generators, nested calls such as `outer(inner())`, early returns, nested
-definitions, recursion, dynamic dispatch, nested composites, and
-unsupported/opaque boundaries are rejected before execution. This avoids
-inferring order by sorting every AST call by source location.
+The branch may instead depend on a `bool` returned by the immediately
+preceding consequential child. Wrap that value with `composite_choice()` in
+the `if` condition:
+
+```python
+from mycelium import composite, composite_choice
+
+@composite(storage)
+def publish_after_check(operation_id: str):
+    allowed = check_release(idempotency_key=f"{operation_id}:check")
+    if composite_choice(allowed):
+        result = publish_change(idempotency_key=f"{operation_id}:publish")
+    else:
+        result = record_hold(idempotency_key=f"{operation_id}:hold")
+    return result
+```
+
+The check is an ordinary ledgered child with a durable, faithfully replayed
+boolean result. Both possible path definitions are pinned before the check
+runs, including when the host supplies an explicit workflow version. Mycelium
+stores the selected path under the parent fence
+after that child resolves and before any branch child executes. A crash after
+selection replays the check's stored result, verifies the same path, and
+continues with stored child results. A changed choice blocks. The check must
+be assigned immediately before the `if`; direct reads and mutable external
+facts cannot determine a replayable branch.
+
+Multiple or nested conditions, short-circuit or conditional expressions,
+loops, comprehensions, generators, nested calls such as `outer(inner())`,
+early returns, nested definitions, recursion, dynamic dispatch, nested
+composites, and unsupported/opaque boundaries are rejected before execution.
+This avoids inferring order by sorting every AST call by source location.
 Static analysis is preflight assistance, not proof that arbitrary hidden
 effects were found. Deterministic local computation may rerun, but time,
 randomness, mutable globals, fresh external reads, and other nondeterministic
@@ -129,5 +155,5 @@ cancel an external request already sent.
 The implementation chooses a lightweight durable parent-control record plus
 ordinary child `LedgerEntry` rows. `handoff_scope()` remains audit causation
 only. The parent is not an atomic transaction and never aggregates away child
-ambiguity. General workflow scheduling and conditions based on prior child
-outcomes remain deferred.
+ambiguity. General workflow scheduling and arbitrary conditions based on
+prior child outcomes remain deferred.
