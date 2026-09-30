@@ -98,13 +98,103 @@ def test_composite_rejects_unsupported_control_flow(tmp_path) -> None:
     def effect(idempotency_key: str) -> str:
         return "ok"
 
-    with pytest.raises(CompositeUnsupportedError, match="straight-line"):
+    with pytest.raises(CompositeUnsupportedError, match="branch cannot return early"):
 
         @composite(storage)
         def unsupported(operation_id: str) -> str:
             if operation_id:
                 return effect(idempotency_key="x")
             return effect(idempotency_key="y")
+
+
+def test_input_boolean_branch_pins_path_and_replays_only_selected_children(tmp_path) -> None:
+    storage = SqliteLedgerStorage(tmp_path / "ledger.sqlite")
+    calls: list[str] = []
+    crash = {"enabled": True}
+
+    @ledger_sync(storage=storage, transition_binding=_binding())
+    def approve(idempotency_key: str) -> str:
+        with side_effect():
+            calls.append("approve")
+        return "approved"
+
+    @ledger_sync(storage=storage, transition_binding=_binding())
+    def deny(idempotency_key: str) -> str:
+        with side_effect():
+            calls.append("deny")
+        return "denied"
+
+    @ledger_sync(storage=storage, transition_binding=_binding())
+    def record(idempotency_key: str, decision: str) -> str:
+        with side_effect():
+            calls.append(f"record:{decision}")
+        return decision
+
+    def crash_after_branch() -> None:
+        if crash["enabled"]:
+            raise RuntimeError("simulated crash")
+
+    register_composite_helper(crash_after_branch)
+
+    @composite(storage)
+    def decide(operation_id: str, approved: bool) -> str:
+        if approved:
+            decision = approve(idempotency_key="approve")
+        else:
+            decision = deny(idempotency_key="deny")
+        crash_after_branch()
+        return record(idempotency_key="record", decision=decision)
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        decide(operation_id="job-1", approved=True)
+    assert calls == ["approve"]
+    with pytest.raises(CompositeDefinitionDriftError):
+        decide(operation_id="job-1", approved=False)
+    assert calls == ["approve"]
+
+    crash["enabled"] = False
+    assert decide(operation_id="job-1", approved=True) == "approved"
+    assert calls == ["approve", "record:approved"]
+    assert decide(operation_id="job-2", approved=False) == "denied"
+    assert calls == ["approve", "record:approved", "deny", "record:denied"]
+
+    controls = json.loads((tmp_path / "ledger.sqlite.composites.json").read_text())
+    assert controls["mycelium:job-1"]["manifest"]["path"] == "input:approved:then"
+    assert controls["mycelium:job-2"]["manifest"]["path"] == "input:approved:else"
+
+
+def test_composite_branch_requires_immutable_boolean_argument(tmp_path) -> None:
+    storage = SqliteLedgerStorage(tmp_path / "ledger.sqlite")
+
+    @ledger_sync(storage=storage, transition_binding=_binding())
+    def effect(idempotency_key: str) -> str:
+        return "ok"
+
+    @composite(
+        storage,
+        operation_id_from=lambda args, kwargs: args[0] if args else kwargs["operation_id"],
+    )
+    def decide(operation_id: str, enabled: bool) -> str:
+        if not enabled:
+            result = effect(idempotency_key="disabled")
+        else:
+            result = effect(idempotency_key="enabled")
+        return result
+
+    with pytest.raises(CompositeUnsupportedError, match="must be a bool"):
+        decide(operation_id="job-1", enabled="yes")  # type: ignore[arg-type]
+    assert decide("job-1", False) == "ok"
+
+    with pytest.raises(CompositeUnsupportedError, match="cannot be reassigned"):
+
+        @composite(storage)
+        def mutable(operation_id: str, enabled: bool) -> str:
+            enabled = not enabled
+            if enabled:
+                result = effect(idempotency_key="a")
+            else:
+                result = effect(idempotency_key="b")
+            return result
 
 
 def test_composite_rejects_expression_control_flow_before_any_effect(tmp_path) -> None:

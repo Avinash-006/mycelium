@@ -81,14 +81,18 @@ class CompositeManifest:
     definition: str
     steps: tuple[CompositeStep, ...]
     digest: str
+    path: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "function": self.function,
             "definition": self.definition,
             "steps": [step.to_dict() for step in self.steps],
             "digest": self.digest,
         }
+        if self.path is not None:
+            result["path"] = self.path
+        return result
 
 
 @dataclass(frozen=True)
@@ -221,7 +225,7 @@ _UNSUPPORTED_EXECUTABLE_NODES = (
 )
 
 
-def _straight_line_body(func: Callable[..., Any], parsed: ast.Module) -> list[ast.stmt]:
+def _function_body(func: Callable[..., Any], parsed: ast.Module) -> list[ast.stmt]:
     definitions = [
         node for node in parsed.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -231,28 +235,78 @@ def _straight_line_body(func: Callable[..., Any], parsed: ast.Module) -> list[as
         raise CompositeUnsupportedError(
             f"cannot locate the inspected body of {func.__qualname__}; keep the composite source inspectable"
         )
-    body = definitions[0].body
-    for index, statement in enumerate(body):
-        if not isinstance(statement, _ALLOWED_STATEMENTS):
+    return definitions[0].body
+
+
+def _validate_statement(func: Callable[..., Any], statement: ast.stmt) -> None:
+    if not isinstance(statement, _ALLOWED_STATEMENTS):
+        raise CompositeUnsupportedError(
+            f"{func.__qualname__} uses unsupported executable syntax "
+            f"{type(statement).__name__} at line {getattr(statement, 'lineno', '?')}; "
+            "composites support straight-line assignments, expressions, and a final return only"
+        )
+    for node in ast.walk(statement):
+        if isinstance(node, _UNSUPPORTED_EXECUTABLE_NODES):
             raise CompositeUnsupportedError(
                 f"{func.__qualname__} uses unsupported executable syntax "
-                f"{type(statement).__name__} at line {getattr(statement, 'lineno', '?')}; "
-                "composites support straight-line assignments, expressions, and a final return only"
+                f"{type(node).__name__} at line {getattr(node, 'lineno', '?')}; "
+                "conditional expressions, short-circuit expressions, comprehensions, "
+                "generators, lambdas, and nested definitions are not supported"
             )
+
+
+def _straight_line_body(func: Callable[..., Any], parsed: ast.Module) -> list[ast.stmt]:
+    body = _function_body(func, parsed)
+    for index, statement in enumerate(body):
+        _validate_statement(func, statement)
         if isinstance(statement, ast.Return) and index != len(body) - 1:
             raise CompositeUnsupportedError(
                 f"{func.__qualname__} returns before the end of its body at line {statement.lineno}; "
                 "early returns are unsupported because they can omit required child steps"
             )
-        for node in ast.walk(statement):
-            if isinstance(node, _UNSUPPORTED_EXECUTABLE_NODES):
-                raise CompositeUnsupportedError(
-                    f"{func.__qualname__} uses unsupported executable syntax "
-                    f"{type(node).__name__} at line {getattr(node, 'lineno', '?')}; "
-                    "conditional expressions, short-circuit expressions, comprehensions, "
-                    "generators, lambdas, and nested definitions are not supported"
-                )
     return body
+
+
+def _input_branch_paths(
+    func: Callable[..., Any], parsed: ast.Module
+) -> tuple[str, bool, list[ast.stmt], list[ast.stmt]] | None:
+    body = _function_body(func, parsed)
+    branches = [(index, stmt) for index, stmt in enumerate(body) if isinstance(stmt, ast.If)]
+    if not branches:
+        return None
+    if len(branches) != 1:
+        raise CompositeUnsupportedError("composites support one top-level input boolean branch")
+    branch_index, branch = branches[0]
+    condition = branch.test
+    inverted = isinstance(condition, ast.UnaryOp) and isinstance(condition.op, ast.Not)
+    if inverted:
+        condition = condition.operand
+    if not isinstance(condition, ast.Name) or condition.id not in inspect.signature(func).parameters:
+        raise CompositeUnsupportedError(
+            "composite branch condition must be a boolean function argument or its negation"
+        )
+    if any(
+        isinstance(node, ast.Name)
+        and node.id == condition.id
+        and isinstance(node.ctx, (ast.Store, ast.Del))
+        for statement in body for node in ast.walk(statement)
+    ):
+        raise CompositeUnsupportedError("composite branch argument cannot be reassigned")
+    for index, statement in enumerate(body):
+        if index == branch_index:
+            for arm_statement in (*branch.body, *branch.orelse):
+                _validate_statement(func, arm_statement)
+                if isinstance(arm_statement, ast.Return):
+                    raise CompositeUnsupportedError("composite branch cannot return early")
+        else:
+            _validate_statement(func, statement)
+            if isinstance(statement, ast.Return) and index != len(body) - 1:
+                raise CompositeUnsupportedError("composite cannot return before its final statement")
+    return (
+        condition.id, inverted,
+        [*body[:branch_index], *branch.body, *body[branch_index + 1:]],
+        [*body[:branch_index], *branch.orelse, *body[branch_index + 1:]],
+    )
 
 
 def _direct_call(statement: ast.stmt) -> ast.Call | None:
@@ -281,11 +335,15 @@ def _direct_call(statement: ast.stmt) -> ast.Call | None:
     return expression
 
 
-def _build_manifest(func: Callable[..., Any], definition: str | None) -> CompositeManifest:
+def _build_manifest(
+    func: Callable[..., Any], definition: str | None,
+    *, body: list[ast.stmt] | None = None, path: str | None = None,
+) -> CompositeManifest:
     try:
         source = inspect.getsource(inspect.unwrap(func))
         parsed = ast.parse(inspect.cleandoc(source))
-        body = _straight_line_body(func, parsed)
+        if body is None:
+            body = _straight_line_body(func, parsed)
     except (OSError, TypeError, SyntaxError) as exc:
         raise CompositeUnsupportedError(
             f"cannot statically inspect {func.__qualname__}; register supported "
@@ -340,8 +398,10 @@ def _build_manifest(func: Callable[..., Any], definition: str | None) -> Composi
         "definition": definition or "auto:" + hashlib.sha256(inspect.getsource(inspect.unwrap(func)).encode()).hexdigest(),
         "steps": [step.to_dict() for step in steps],
     }
+    if path is not None:
+        payload["path"] = path
     digest = hashlib.sha256(canonical_json(payload).encode()).hexdigest()
-    return CompositeManifest(payload["function"], payload["definition"], tuple(steps), digest)
+    return CompositeManifest(payload["function"], payload["definition"], tuple(steps), digest, path)
 
 
 class _ControlStore:
@@ -783,14 +843,34 @@ def composite(
     lease_ttl: float = 3600.0,
     renewal_interval: float | None = None,
 ) -> Callable[[Callable[..., R]], Callable[..., R]]:
-    """Decorate an unchanged straight-line function for child recovery.
+    """Decorate an unchanged straight-line or input-boolean-branch function.
 
     Child calls must be the actual callables wrapped by ``ledger`` or
     ``ledger_sync``.  ``operation_id_from`` must return the same logical ID on
     retries; it must not generate a new random ID per dispatch.
     """
     def decorate(func: Callable[..., R]) -> Callable[..., R]:
-        manifest = _build_manifest(func, definition)
+        try:
+            parsed = ast.parse(inspect.cleandoc(inspect.getsource(inspect.unwrap(func))))
+        except (OSError, TypeError, SyntaxError) as exc:
+            raise CompositeUnsupportedError(
+                f"cannot statically inspect {func.__qualname__}; keep the composite source inspectable"
+            ) from exc
+        branch_paths = _input_branch_paths(func, parsed)
+        if branch_paths is None:
+            manifest = _build_manifest(func, definition)
+            branch_manifests = None
+        else:
+            argument, _, then_body, else_body = branch_paths
+            branch_manifests = {
+                True: _build_manifest(
+                    func, definition, body=then_body, path=f"input:{argument}:then"
+                ),
+                False: _build_manifest(
+                    func, definition, body=else_body, path=f"input:{argument}:else"
+                ),
+            }
+            manifest = None
 
         def operation_id(args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
             value = operation_id_from(args, kwargs) if operation_id_from else kwargs.get("operation_id")
@@ -810,13 +890,28 @@ def composite(
                     return copied
             return kwargs
 
+        def selected_manifest(args: tuple[Any, ...], kwargs: dict[str, Any]) -> CompositeManifest:
+            if branch_paths is None:
+                assert manifest is not None
+                return manifest
+            assert branch_manifests is not None
+            argument, inverted, _, _ = branch_paths
+            bound = inspect.signature(func).bind(*args, **call_kwargs(kwargs))
+            bound.apply_defaults()
+            value = bound.arguments.get(argument)
+            if type(value) is not bool:
+                raise CompositeUnsupportedError(
+                    f"composite branch argument {argument!r} must be a bool"
+                )
+            return branch_manifests[value != inverted]
+
         if inspect.iscoroutinefunction(func):
             @functools.wraps(func)
             async def async_wrapper(*args: Any, **kwargs: Any) -> R:
                 with CompositeInvocation(
                     storage,
                     operation_id(args, kwargs),
-                    manifest,
+                    selected_manifest(args, kwargs),
                     namespace=namespace,
                     lease_ttl=lease_ttl,
                     renewal_interval=renewal_interval,
@@ -826,7 +921,10 @@ def composite(
                     if active is not None:
                         active.validate_result(result)
                     return result
-            setattr(async_wrapper, "_mycelium_composite_manifest", manifest)
+            if manifest is not None:
+                setattr(async_wrapper, "_mycelium_composite_manifest", manifest)
+            else:
+                setattr(async_wrapper, "_mycelium_composite_manifests", branch_manifests)
             return cast(Callable[..., R], async_wrapper)
 
         @functools.wraps(func)
@@ -834,7 +932,7 @@ def composite(
             with CompositeInvocation(
                 storage,
                 operation_id(args, kwargs),
-                manifest,
+                selected_manifest(args, kwargs),
                 namespace=namespace,
                 lease_ttl=lease_ttl,
                 renewal_interval=renewal_interval,
@@ -844,7 +942,10 @@ def composite(
                 if active is not None:
                     active.validate_result(result)
                 return result
-        setattr(sync_wrapper, "_mycelium_composite_manifest", manifest)
+        if manifest is not None:
+            setattr(sync_wrapper, "_mycelium_composite_manifest", manifest)
+        else:
+            setattr(sync_wrapper, "_mycelium_composite_manifests", branch_manifests)
         return cast(Callable[..., R], sync_wrapper)
     return decorate
 
