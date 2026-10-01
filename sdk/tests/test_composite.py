@@ -24,6 +24,7 @@ from mycelium import (
     ToolTransitionBinding,
     composite,
     composite_choice,
+    composite_items,
     ledger,
     ledger_sync,
     register_composite_helper,
@@ -295,6 +296,122 @@ def test_existing_composite_child_replays_after_request_identity_change(
 
     assert single(operation_id="legacy") == "legacy:effect"
     assert calls == ["legacy:effect"]
+
+
+def test_host_items_loop_resumes_and_rejects_changed_items(tmp_path) -> None:
+    storage = SqliteLedgerStorage(tmp_path / "ledger.sqlite")
+    calls: list[str] = []
+    crash = {"enabled": True}
+
+    @ledger_sync(storage=storage, transition_binding=_binding())
+    def publish(idempotency_key: str, item: str) -> str:
+        with side_effect():
+            calls.append(item)
+        return item
+
+    def crash_before_last(item: str) -> None:
+        if item == "C" and crash["enabled"]:
+            raise RuntimeError("simulated item crash")
+
+    register_composite_helper(crash_before_last)
+
+    @composite(storage)
+    def batch(operation_id: str, items: list[str]) -> str:
+        for item in composite_items(items, max_items=3):
+            crash_before_last(item)
+            result = publish(idempotency_key=f"{operation_id}:{item}", item=item)
+        return result
+
+    with pytest.raises(RuntimeError, match="simulated item crash"):
+        batch(operation_id="batch-1", items=["A", "B", "C"])
+    assert calls == ["A", "B"]
+    with pytest.raises(CompositeDefinitionDriftError):
+        batch(operation_id="batch-1", items=["B", "A", "C"])
+    with pytest.raises(CompositeDefinitionDriftError):
+        batch(operation_id="batch-1", items=["A", "B"])
+    assert calls == ["A", "B"]
+
+    crash["enabled"] = False
+    assert batch(operation_id="batch-1", items=["A", "B", "C"]) == "C"
+    assert batch(operation_id="batch-1", items=["A", "B", "C"]) == "C"
+    assert calls == ["A", "B", "C"]
+    records = json.loads((tmp_path / "ledger.sqlite.composites.json").read_text())
+    steps = records["mycelium:batch-1"]["manifest"]["steps"]
+    assert len(steps) == len({step["step_id"] for step in steps}) == 3
+
+
+def test_host_items_loop_rejects_invalid_input_before_effect(tmp_path) -> None:
+    storage = SqliteLedgerStorage(tmp_path / "ledger.sqlite")
+    calls: list[str] = []
+
+    @ledger_sync(storage=storage, transition_binding=_binding())
+    def publish(idempotency_key: str, item: str) -> str:
+        with side_effect():
+            calls.append(item)
+        return item
+
+    @composite(storage)
+    def batch(operation_id: str, items: list[str]) -> str:
+        for item in composite_items(items, max_items=2):
+            result = publish(idempotency_key=f"{operation_id}:{item}", item=item)
+        return result
+
+    for invalid in ([], ["A", "B", "C"], ("A",), [float("nan")], [{1: "A"}]):
+        with pytest.raises(CompositeUnsupportedError):
+            batch(operation_id="invalid", items=invalid)  # type: ignore[arg-type]
+    with pytest.raises(CompositeUnsupportedError, match="active composite"):
+        composite_items(["A"], max_items=2)
+    assert calls == []
+
+
+def test_host_items_loop_detects_mutation_before_iteration(tmp_path) -> None:
+    storage = SqliteLedgerStorage(tmp_path / "ledger.sqlite")
+    calls: list[str] = []
+
+    @ledger_sync(storage=storage, transition_binding=_binding())
+    def publish(idempotency_key: str, item: str) -> str:
+        with side_effect():
+            calls.append(item)
+        return item
+
+    items = ["A", "B"]
+
+    def change_items() -> None:
+        items.reverse()
+
+    register_composite_helper(change_items)
+
+    @composite(storage)
+    def batch(operation_id: str, items: list[str]) -> str:
+        change_items()
+        for item in composite_items(items, max_items=2):
+            result = publish(idempotency_key=f"{operation_id}:{item}", item=item)
+        return result
+
+    with pytest.raises(CompositeDefinitionDriftError, match="changed before its loop"):
+        batch(operation_id="mutated", items=items)
+    assert calls == []
+
+
+async def test_async_host_items_loop_replays_completed_children(tmp_path) -> None:
+    storage = SqliteLedgerStorage(tmp_path / "ledger.sqlite")
+    calls: list[str] = []
+
+    @ledger(storage=storage, transition_binding=_binding())
+    async def publish(idempotency_key: str, item: str) -> str:
+        async with side_effect_async():
+            calls.append(item)
+        return item
+
+    @composite(storage)
+    async def batch(operation_id: str, items: list[str]) -> str:
+        for item in composite_items(items, max_items=2):
+            result = await publish(idempotency_key=f"{operation_id}:{item}", item=item)
+        return result
+
+    assert await batch(operation_id="async-items", items=["A", "B"]) == "B"
+    assert await batch(operation_id="async-items", items=["A", "B"]) == "B"
+    assert calls == ["A", "B"]
 
 
 def test_input_boolean_branch_pins_path_and_replays_only_selected_children(tmp_path) -> None:
