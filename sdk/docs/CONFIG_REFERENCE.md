@@ -140,6 +140,15 @@ Defaults and allowlist for tool-level durable execution.
 | `request_identity_policy` | `"derived" \| "require_explicit" \| null` | `null` | — |
 | `on_args_drift` | `"soft" \| "hard" \| "off"` | `null` | — |
 | `missing_run_id_policy` | `"warn" \| "error" \| null` | `null` | — |
+| `payload_policy` | `LedgerPayloadPolicyModel \| null` | `null` | — |
+
+## LedgerPayloadPolicyModel
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `store_args` | `boolean` | `true` | — |
+| `store_result` | `boolean` | `true` | — |
+| `redact_fields` | `array[string]` | — | — |
 
 ## MessageValidator
 

@@ -34,25 +34,28 @@ def _entry(request_id: str, *, version: int, outcome: str = "COMPLETED") -> Ledg
     )
 
 
-def test_plan_and_apply_v1_to_v2_are_explicit_and_idempotent() -> None:
+def test_plan_and_apply_to_v3_are_explicit_and_idempotent() -> None:
     storage = InMemoryLedgerStorage()
     storage.set(_entry("legacy-1", version=1))
     storage.set(_entry("current-2", version=2))
 
     plan = plan_ledger_migration(storage)
     assert plan.total_entries == 2
-    assert plan.pending_entries == 1
-    assert plan.current_entries == 1
+    assert plan.pending_entries == 2
+    assert plan.current_entries == 0
     assert plan.version_counts == {1: 1, 2: 1}
 
     result = apply_ledger_migration(storage)
-    assert result.migrated_entries == 1
-    assert result.unchanged_entries == 1
+    assert result.migrated_entries == 2
+    assert result.unchanged_entries == 0
     migrated = storage.get("legacy-1")
     assert migrated is not None
-    assert migrated.schema_version == 2
+    assert migrated.schema_version == 3
     assert migrated.effect_id == "legacy-1"
     assert migrated.request_id_aliases == ("legacy-1",)
+    current = storage.get("current-2")
+    assert current is not None and current.schema_version == 3
+    assert current.result_retained is True
 
     again = apply_ledger_migration(storage)
     assert again.migrated_entries == 0
@@ -61,9 +64,9 @@ def test_plan_and_apply_v1_to_v2_are_explicit_and_idempotent() -> None:
 
 def test_future_schema_and_downgrade_fail_closed() -> None:
     storage = InMemoryLedgerStorage()
-    storage.set(_entry("future", version=3))
+    storage.set(_entry("future", version=4))
     plan = plan_ledger_migration(storage)
-    assert plan.unsupported_versions == (3,)
+    assert plan.unsupported_versions == (4,)
     assert not plan.can_apply
     with pytest.raises(LedgerMigrationError, match="unsupported schema"):
         apply_ledger_migration(storage)
@@ -83,7 +86,7 @@ def test_runtime_reader_accepts_legacy_and_rejects_invalid_or_future_versions() 
         with pytest.raises(LedgerSchemaVersionError, match="schema_version"):
             LedgerEntry.from_dict(raw)
 
-    raw["schema_version"] = 3
+    raw["schema_version"] = 4
     with pytest.raises(LedgerSchemaVersionError, match="newer than this runtime"):
         LedgerEntry.from_dict(raw)
 
@@ -133,7 +136,7 @@ def test_cli_file_plan_apply_and_verify(tmp_path: Path, capsys) -> None:
     raw = json.loads(ledger_path.read_text(encoding="utf-8"))["legacy-cli"]
     assert raw["effect_id"] == "legacy-cli"
     assert raw["request_id_aliases"] == ["legacy-cli"]
-    assert raw["schema_version"] == 2
+    assert raw["schema_version"] == 3
 
     assert main(["migrate", "--plan", "--file", str(ledger_path), "--json"]) == 0
     verified = json.loads(capsys.readouterr().out)
@@ -142,7 +145,7 @@ def test_cli_file_plan_apply_and_verify(tmp_path: Path, capsys) -> None:
 
 def test_cli_cleanly_refuses_future_file_schema(tmp_path: Path, capsys) -> None:
     ledger_path = tmp_path / "future.json"
-    payload = _entry("future-cli", version=3).to_dict()
+    payload = _entry("future-cli", version=4).to_dict()
     ledger_path.write_text(
         json.dumps({"future-cli": payload}),
         encoding="utf-8",
@@ -164,7 +167,7 @@ def test_cli_sqlite_plan_and_apply(tmp_path: Path, capsys) -> None:
 
     migrated = storage.get("legacy-sqlite")
     assert migrated is not None
-    assert migrated.schema_version == 2
+    assert migrated.schema_version == 3
 
 
 def test_raw_file_schema_inspection_is_read_only(tmp_path: Path) -> None:
@@ -172,7 +175,7 @@ def test_raw_file_schema_inspection_is_read_only(tmp_path: Path) -> None:
     rows = {
         "legacy": _entry("legacy", version=1).to_dict(),
         "current": _entry("current", version=2).to_dict(),
-        "future": _entry("future", version=3).to_dict(),
+        "future": _entry("future", version=4).to_dict(),
     }
     ledger_path.write_text(json.dumps(rows), encoding="utf-8")
     before = ledger_path.read_bytes()
@@ -181,7 +184,7 @@ def test_raw_file_schema_inspection_is_read_only(tmp_path: Path) -> None:
         {"storage": "file", "path": str(ledger_path)}
     )
 
-    assert versions == {1: 1, 2: 1, 3: 1}
+    assert versions == {1: 1, 2: 1, 4: 1}
     assert ledger_path.read_bytes() == before
 
 
@@ -198,7 +201,7 @@ def test_raw_sqlite_schema_inspection_does_not_create_or_update_storage(
     storage = SqliteLedgerStorage(ledger_path)
     storage.set(_entry("legacy", version=1))
     with sqlite3.connect(ledger_path) as conn:
-        payload = _entry("future", version=3).to_dict()
+        payload = _entry("future", version=4).to_dict()
         conn.execute(
             "INSERT INTO mycelium_action_ledger (request_id, payload) VALUES (?, ?)",
             ("future", json.dumps(payload)),
@@ -210,7 +213,7 @@ def test_raw_sqlite_schema_inspection_does_not_create_or_update_storage(
         {"storage": "sqlite", "path": str(ledger_path)}
     )
 
-    assert versions == {1: 1, 3: 1}
+    assert versions == {1: 1, 4: 1}
     assert ledger_path.read_bytes() == before
 
 

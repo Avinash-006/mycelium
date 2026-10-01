@@ -90,6 +90,12 @@ class TransitionConfigModel(_ConfigModel):
     presumed_dead_after: float | None = Field(default=None, gt=0)
 
 
+class LedgerPayloadPolicyModel(_ConfigModel):
+    store_args: bool = True
+    store_result: bool = True
+    redact_fields: list[str] = Field(default_factory=list)
+
+
 class LedgerConfigModel(StorageConfigModel):
     """Defaults and allowlist for tool-level durable execution."""
 
@@ -113,6 +119,7 @@ class LedgerConfigModel(StorageConfigModel):
     missing_run_id_policy: str | None = Field(
         default=None, json_schema_extra={"enum": ["warn", "error", None]}
     )
+    payload_policy: LedgerPayloadPolicyModel | None = None
 
 
 class TaskLedgerConfigModel(StorageConfigModel):

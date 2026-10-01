@@ -7,6 +7,9 @@ small PyPI versions. Pre-release checklist: [sdk/docs/RELEASE.md](sdk/docs/RELEA
 
 ### Added
 
+- Add opt-in action-ledger argument omission, recursive field redaction, and
+  result omission with explicit replay refusal for completed calls. Ledger entry
+  schema 3 makes older workers reject the new payload-state fields.
 - Support one fixed-count `range(N)` loop in Python `@composite` workflows,
   pinning a distinct child identity for each of up to 32 iterations and
   resuming from the first unresolved iteration after a crash.

@@ -229,7 +229,13 @@ def _upgrade_v1_to_v2(entry: LedgerEntry) -> LedgerEntry:
     )
 
 
-_UPGRADES = {1: _upgrade_v1_to_v2}
+def _upgrade_v2_to_v3(entry: LedgerEntry) -> LedgerEntry:
+    # Older entries retained their result and call evidence. The new metadata
+    # defaults preserve that behavior; omitted evidence is only written by v3.
+    return replace(entry, schema_version=3)
+
+
+_UPGRADES = {1: _upgrade_v1_to_v2, 2: _upgrade_v2_to_v3}
 
 
 def upgrade_ledger_entry(

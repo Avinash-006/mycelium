@@ -446,6 +446,11 @@ def _run_ledgered(
         raise
     request_id = existing.request_id
     if existing.is_terminal_completed():
+        if not existing.result_retained:
+            raise LedgerHardBlockError(
+                f"Completed request {request_id!r} has no replayable result; "
+                "retrieve the result from the provider or operator evidence"
+            )
         if composite is not None and composite_child is not None:
             composite.resolve_child(composite_child.step_id)
         ledger._emit_outcome(
@@ -848,6 +853,11 @@ async def _run_ledgered_async(
         raise
     request_id = existing.request_id
     if existing.is_terminal_completed():
+        if not existing.result_retained:
+            raise LedgerHardBlockError(
+                f"Completed request {request_id!r} has no replayable result; "
+                "retrieve the result from the provider or operator evidence"
+            )
         if composite is not None and composite_child is not None:
             composite.resolve_child(composite_child.step_id)
         ledger._emit_outcome(

@@ -12,7 +12,6 @@ from mycelium.ledger_context import (
     _outcome_reexec_authorized,
     _reconcile_cas_lost,
 )
-from mycelium.ledger_identity import _evidence_value
 from mycelium.ledger_model import (
     _IN_FLIGHT_OUTCOMES,
     _RECONCILE_NOT_EXECUTED_OUTCOMES,
@@ -420,11 +419,13 @@ class LedgerRecoveryMixin:
                     f"Cannot release request {request_id!r} as completed: "
                     "no allowed durable ATTEMPTING decision"
                 )
+            retained_result, result_retained = self._retained_result(result)
             entry = replace(
                 existing,
                 status=legacy_status_from_terminal(TerminalOutcome.COMPLETED),
                 terminal_outcome=TerminalOutcome.COMPLETED.value,
-                result=_evidence_value(result),
+                result=retained_result,
+                result_retained=result_retained,
                 finished_at=now,
                 lease_until=None,
                 side_effect_boundary=SideEffectBoundary.CROSSED.value,

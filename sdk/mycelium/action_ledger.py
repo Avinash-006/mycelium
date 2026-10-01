@@ -153,6 +153,7 @@ from mycelium.ledger_model import (
     LedgerWorkerAliveError,
     _has_allowed_attempting_decision,
 )
+from mycelium.ledger_payload import LedgerPayloadPolicy
 from mycelium.ledger_recovery import (
     LedgerRecoveryMixin,
     _format_heartbeat_age,  # noqa: F401  compatibility re-export
@@ -196,8 +197,12 @@ class ActionLedger(LedgerRecoveryMixin):
         reclaim_requires_death_signal: bool = False,
         presumed_dead_after: float | None = None,
         request_identity_policy: str = REQUEST_IDENTITY_POLICY_DERIVED,
+        payload_policy: LedgerPayloadPolicy | None = None,
     ) -> None:
         self._storage = storage if storage is not None else InMemoryLedgerStorage()
+        if payload_policy is not None and not isinstance(payload_policy, LedgerPayloadPolicy):
+            raise ValueError("payload_policy must be a LedgerPayloadPolicy")
+        self._payload_policy = payload_policy or LedgerPayloadPolicy()
         self._lease_ttl = lease_ttl
         # None → renew at lease_ttl/3 while @ledger tool bodies run; <=0 disables.
         self._lease_renew_interval = lease_renew_interval
@@ -367,7 +372,7 @@ class ActionLedger(LedgerRecoveryMixin):
             and existing is not None
         )
         if existing is not None:
-            stored_fp = _args_drift_fingerprint(
+            stored_fp = existing.args_digest or _args_drift_fingerprint(
                 tuple(existing.args), dict(existing.kwargs), exclude=exclude
             )
             if alias_redispatch:
@@ -378,7 +383,7 @@ class ActionLedger(LedgerRecoveryMixin):
                     for key, value in dict(existing.kwargs).items()
                     if key != "request_id"
                 }
-                stored_alias_fp = _args_drift_fingerprint(
+                stored_alias_fp = existing.args_alias_digest or _args_drift_fingerprint(
                     tuple(existing.args), stored_alias_kwargs, exclude=exclude
                 )
                 if (
@@ -422,7 +427,7 @@ class ActionLedger(LedgerRecoveryMixin):
                     entry_dispatch = derive_dispatch_id(entry_kwargs)
                     if entry_dispatch != dispatch_id:
                         continue
-                    stored_fp = _args_drift_fingerprint(
+                    stored_fp = entry.args_digest or _args_drift_fingerprint(
                         tuple(entry.args), entry_kwargs, exclude=exclude
                     )
                     if stored_fp != incoming_fp:
@@ -639,6 +644,31 @@ class ActionLedger(LedgerRecoveryMixin):
         if handoff_raw is None and active_handoff is not None:
             handoff_raw = active_handoff.handoff_id
         stored_args, stored_kwargs = _evidence_args(bound["args"], bound["kwargs"])
+        args_digest = None
+        args_alias_digest = None
+        if not self._payload_policy.store_args or self._payload_policy.redact_fields:
+            exclude = _args_drift_exclude_keys(binding)
+            args_digest = _args_drift_fingerprint(args, kwargs, exclude=exclude)
+            alias_kwargs = {key: value for key, value in kwargs.items() if key != "request_id"}
+            args_alias_digest = _args_drift_fingerprint(args, alias_kwargs, exclude=exclude)
+            if not self._payload_policy.store_args:
+                # Keep only host routing metadata used by scope and dispatch checks.
+                keys = set(LEDGER_KWARG_KEYS)
+                if binding is not None:
+                    keys.update(binding.scope_from.values())
+                stored_args = []
+                stored_kwargs = {key: value for key, value in stored_kwargs.items() if key in keys}
+            protected = set(stored_kwargs) & set(self._payload_policy.redact_fields) & (
+                set(LEDGER_KWARG_KEYS)
+                | (set(binding.scope_from.values()) if binding is not None else set())
+            )
+            if protected:
+                raise ValueError(
+                    "payload_policy cannot redact identity/scope fields: "
+                    + ", ".join(sorted(protected))
+                )
+            stored_args, _ = self._payload_policy.redact(stored_args)
+            stored_kwargs, _ = self._payload_policy.redact(stored_kwargs)
         # Stable effect identity, present whenever a binding is available to
         # derive it from (classified tools only — unclassified claim() has no
         # side-effect class and stays effect_id=None). Same derivation as
@@ -658,6 +688,8 @@ class ActionLedger(LedgerRecoveryMixin):
             tool=tool,
             args=stored_args,
             kwargs=stored_kwargs,
+            args_digest=args_digest,
+            args_alias_digest=args_alias_digest,
             status=legacy_status_from_terminal(TerminalOutcome.IN_FLIGHT),
             terminal_outcome=TerminalOutcome.IN_FLIGHT.value,
             owner=_ledger_owner(),
@@ -1636,6 +1668,12 @@ class ActionLedger(LedgerRecoveryMixin):
             ):
                 return
 
+    def _retained_result(self, result: Any) -> tuple[Any, bool]:
+        if not self._payload_policy.store_result:
+            return None, False
+        value, redacted = self._payload_policy.redact(_evidence_value(result))
+        return value, not redacted
+
     def complete(
         self,
         request_id: str,
@@ -1659,11 +1697,13 @@ class ActionLedger(LedgerRecoveryMixin):
             raise LedgerOutcomeAlreadySetError(
                 f"Cannot complete request {request_id!r}: no durable ATTEMPTING decision"
             )
+        retained_result, result_retained = self._retained_result(result)
         entry = replace(
             existing,
             status=legacy_status_from_terminal(TerminalOutcome.COMPLETED),
             terminal_outcome=TerminalOutcome.COMPLETED.value,
-            result=_evidence_value(result),
+            result=retained_result,
+            result_retained=result_retained,
             finished_at=time.time(),
             lease_until=None,
             side_effect_boundary=SideEffectBoundary.CROSSED.value,
@@ -2183,6 +2223,7 @@ def ledger(
     reclaim_requires_death_signal: bool = False,
     presumed_dead_after: float | None = None,
     request_identity_policy: str = REQUEST_IDENTITY_POLICY_DERIVED,
+    payload_policy: LedgerPayloadPolicy | None = None,
 ) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]:
     """Decorator that records async tool invocations in an ActionLedger.
 
@@ -2215,6 +2256,7 @@ def ledger(
         unclassified_policy=unclassified_policy,
         on_args_drift=on_args_drift,
         request_identity_policy=request_identity_policy,
+        payload_policy=payload_policy,
         **ledger_kwargs,
     )
 
@@ -2258,6 +2300,7 @@ def ledger_sync(
     reclaim_requires_death_signal: bool = False,
     presumed_dead_after: float | None = None,
     request_identity_policy: str = REQUEST_IDENTITY_POLICY_DERIVED,
+    payload_policy: LedgerPayloadPolicy | None = None,
 ) -> Callable[[Callable[P, R]], Callable[P, R]]:
     """Decorator that records sync tool invocations in an ActionLedger.
 
@@ -2290,6 +2333,7 @@ def ledger_sync(
         unclassified_policy=unclassified_policy,
         on_args_drift=on_args_drift,
         request_identity_policy=request_identity_policy,
+        payload_policy=payload_policy,
         **ledger_kwargs,
     )
 

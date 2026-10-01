@@ -1,9 +1,8 @@
 # Proposal: action-ledger payload controls
 
-Status: proposed, unimplemented. This document requests design review for
-[issue #82](https://github.com/mycelium-labs/mycelium/issues/82); it does not close
-that issue or add configuration options. [Ledger payload storage](LEDGER_PAYLOAD_STORAGE.md)
-describes current behavior and the persisted-field inventory.
+Status: original design proposal. The initial action-ledger payload policy is
+documented in [ledger payload storage](LEDGER_PAYLOAD_STORAGE.md). The sections
+below also record follow-up work on other write paths, migration, and retention.
 
 The first implementation should let operators omit invocation evidence while
 preserving identity checks. Result omission needs a separate, explicit replay
@@ -56,10 +55,9 @@ that omitting arguments removes every sensitive value.
 
 ## Policy and sanitizer ordering
 
-The issue's `store_args`, `store_result`, and `redact_fields` names are candidate
-API names, not supported settings. Start with argument omission and explicit
-field-path redaction. Define positional-argument paths, nested objects, lists,
-missing fields, and replacement values before accepting configuration. Do not
+The issue's `store_args`, `store_result`, and `redact_fields` names became
+supported action-ledger settings. Further work can add explicit
+field-path redaction for positional arguments and selected nested paths. Do not
 ship arbitrary callbacks or encryption hooks in the first change.
 
 Derive identity through the existing identity rules before optional payload
@@ -136,7 +134,7 @@ Stage acceptance tests as follows:
 4. Test migration failures, stale workers, and payload-expiry races with active
    transitions before adding retention enforcement.
 
-Maintainer decisions still needed: the exact policy/path syntax, whether result
-omission belongs in the first release, the replay-unavailable API, and how long
-operators must retain identity after evidence expires. Arbitrary encryption
-hooks, automatic whole-entry deletion, and TaskLedger policy are deferred.
+Follow-up decisions include positional field paths, sidecar/client replay
+contracts, and how long operators must retain identity after evidence expires.
+Arbitrary encryption hooks, automatic whole-entry deletion, and TaskLedger
+policy remain deferred.

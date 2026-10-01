@@ -5,10 +5,9 @@ ledger entry can contain the arguments sent to a tool, its returned value, and
 the error raised by a failed call. Treat the configured ledger backend as
 operator-sensitive data, not as an opaque cache.
 
-This page describes the behavior shipped today. It does not describe the
-payload-policy design proposed in [issue #82](https://github.com/mycelium-labs/mycelium/issues/82).
-See the [payload-controls proposal](LEDGER_PAYLOAD_POLICY_DESIGN.md) for design
-decisions that still need review before implementation.
+The optional `action_ledger.payload_policy` controls argument and result evidence
+for action-ledger wrappers. The [design note](LEDGER_PAYLOAD_POLICY_DESIGN.md)
+records the remaining scope and migration considerations.
 
 ## What an action-ledger entry contains
 
@@ -25,6 +24,8 @@ part of that record:
 | `terminal_outcome` | Normalized terminal outcome, including ambiguous outcomes. |
 | `fence` | Durable compare-and-set fencing token. |
 | `result` | Tool return-value evidence; may contain provider or business data. |
+| `args_digest`, `args_alias_digest` | Stable argument-conflict fingerprints when argument evidence is omitted or redacted. Hashes can reveal low-entropy inputs by guessing. |
+| `result_retained` | Whether a completed result can be replayed; distinguishes omission from a legitimate `None` return. |
 | `error` | Formatted exception text from a failed call. |
 | `started_at` | Claim/start timestamp. |
 | `finished_at` | Terminal timestamp, when present. |
@@ -50,6 +51,8 @@ part of that record:
 | `effect_phase` | Unified effect-protocol phase (`INTENDED`, `ATTEMPTING`, `COMMITTED`, `ABORTED`, or `UNKNOWN`). |
 | `effect_protocol_required` | Whether the unified effect protocol was required. |
 | `effect_id` | Stable deduplication identity. |
+| `tenant_id` | Optional trusted tenant identifier. |
+| `policy_version` | Optional transition policy version. |
 | `request_id_aliases` | Host request IDs that resolved to the canonical effect row. |
 | `schema_version` | Serialized entry-shape version. |
 | `parent_request_id` | Optional handoff/causation parent request ID. |
@@ -66,6 +69,46 @@ calls to a storage class can write whatever a caller puts in a
 The JSON-backed backends use `default=str` while serializing. Values that are
 not JSON-native can therefore be stored as their string representation rather
 than round-tripping as the original Python type.
+
+## Payload policy
+
+The default retains arguments and results. For a configured wrapper, use:
+
+```yaml
+action_ledger:
+  payload_policy:
+    store_args: false
+    store_result: true
+    redact_fields: [authorization, api_key, message_body]
+```
+
+`store_args: false` leaves `args` empty and keeps only routing and scope keys
+in `kwargs` (`request_id`, `tool_call_id`, `thread_id`, `run_id`, `node`,
+`state_ref`, `decision_id`, `parent_request_id`, `handoff_id`, and configured
+`scope_from` sources). It persists argument fingerprints for conflict detection;
+effect identity is still computed from the original call before omission.
+`redact_fields` replaces matching dictionary keys at any depth, including
+dictionaries within lists, with `[REDACTED]`. It does not address positional
+arguments by name; use `store_args: false` for those. Redacting a result marks
+it unavailable for replay, even if other result fields remain. A legitimate
+stored `None` remains replayable.
+
+With `store_result: false`, the first caller receives the live result, while
+the stored row contains `result: null` and `result_retained: false`. A later
+duplicate raises `LedgerHardBlockError` after confirming completion; it does
+not execute the tool again or return a misleading `None` or redacted object.
+The host must retrieve the return value from provider or operator evidence if
+needed. This policy also applies to operator-completed results and to receipts
+emitted from the resulting ledger entry. It does not cover the separate task
+ledger, directly constructed `LedgerEntry` writes to a storage backend, or
+other evidence fields such as `error`, `decision`, provider references, and
+operator reasons. Protect those stores and fields separately.
+
+Payload-state fields use ledger entry schema 3. Older runtimes reject new rows;
+upgrade all workers before writing with this version, and do not run mixed-version
+writers. Existing schema 1/2 rows remain readable. `mycelium migrate`
+can plan and apply an explicit upgrade of existing rows to schema 3; it does
+not delete historical payloads.
 
 ## Where the entry is stored
 
@@ -87,9 +130,8 @@ does not provide a durable safety boundary across workers or restarts.
 
 ## Redaction and exported evidence
 
-There is currently no backend-independent field-selection, encryption, or
-payload-retention setting for `LedgerEntry`. Until issue #82's policy is
-implemented, operators should:
+There is no built-in encryption hook or automatic payload-only expiry.
+Operators should:
 
 1. Enable the applicable evidence sanitizers before configuring a durable
    ledger. `secret_args` can reject or sanitize secret material, but it does

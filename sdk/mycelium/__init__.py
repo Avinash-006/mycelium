@@ -132,6 +132,7 @@ _LAZY_IMPORTS = {
     "LeaseValidity": ("mycelium.transition", "LeaseValidity"),
     "LedgerAlreadyResolvedError": ("mycelium.action_ledger", "LedgerAlreadyResolvedError"),
     "LedgerEntry": ("mycelium.action_ledger", "LedgerEntry"),
+    "LedgerPayloadPolicy": ("mycelium.ledger_payload", "LedgerPayloadPolicy"),
     "LedgerError": ("mycelium.action_ledger", "LedgerError"),
     "LedgerHardBlockError": ("mycelium.action_ledger", "LedgerHardBlockError"),
     "LedgerMigrationError": ("mycelium.ledger_migrations", "LedgerMigrationError"),
