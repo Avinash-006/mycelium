@@ -121,10 +121,10 @@ def _doctor_schema_check(tmp_path: Path, version: int):
         kwargs={},
         status="completed",
         terminal_outcome="COMPLETED",
-        schema_version=min(version, 2),
+        schema_version=min(version, 3),
     )
     storage.set(entry)
-    if version > 2:
+    if version > 3:
         payload = entry.to_dict()
         payload["schema_version"] = version
         with sqlite3.connect(ledger_path) as conn:
@@ -140,7 +140,8 @@ def _doctor_schema_check(tmp_path: Path, version: int):
 
 @pytest.mark.parametrize(
     ("version", "expected"),
-    [(1, DoctorStatus.WARN), (2, DoctorStatus.PASS), (3, DoctorStatus.FAIL)],
+    [(1, DoctorStatus.WARN), (2, DoctorStatus.WARN),
+     (3, DoctorStatus.PASS), (4, DoctorStatus.FAIL)],
 )
 def test_doctor_reports_ledger_schema_versions(
     tmp_path: Path, version: int, expected: DoctorStatus

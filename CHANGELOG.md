@@ -7,6 +7,9 @@ small PyPI versions. Pre-release checklist: [sdk/docs/RELEASE.md](sdk/docs/RELEA
 
 ### Added
 
+- Add opt-in action-ledger argument omission, recursive field redaction, and
+  result omission with explicit replay refusal for completed calls. Ledger entry
+  schema 3 makes older workers reject the new payload-state fields.
 - Allow a Python composite to loop over 1–32 host-supplied JSON-compatible
   items with `composite_items()`. Pin the ordered list fingerprint before child
   effects and block changed items or order on replay.

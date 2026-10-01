@@ -157,6 +157,7 @@ from mycelium.integrations.langgraph import (
     LangGraphIntegrationError,
     instrument_langgraph_tool,
 )
+from mycelium.ledger_payload import LedgerPayloadPolicy
 from mycelium.loop_guard import (
     DEFAULT_CONSECUTIVE_SOFT,
     AtomicLoopGuardStorage,
@@ -669,6 +670,15 @@ class MyceliumConfig:
                     f"{sorted(ARGS_DRIFT_POLICIES)}, got {on_args_drift!r}"
                 )
             ledger_kwargs["on_args_drift"] = on_args_drift
+            payload_config = action_ledger_cfg.get("payload_policy", {})
+            if not isinstance(payload_config, dict) or set(payload_config) - {
+                "store_args", "store_result", "redact_fields"
+            }:
+                raise ConfigError("'action_ledger.payload_policy' has invalid fields")
+            try:
+                ledger_kwargs["payload_policy"] = LedgerPayloadPolicy(**payload_config)
+            except (TypeError, ValueError) as exc:
+                raise ConfigError(f"invalid action_ledger.payload_policy: {exc}") from exc
             ledger_kwargs["request_identity_policy"] = _request_identity_policy(
                 action_ledger_cfg, profile=self.profile
             )

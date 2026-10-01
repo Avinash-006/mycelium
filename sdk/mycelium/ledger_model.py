@@ -239,7 +239,7 @@ _UNCLASSIFIED_BINDING = ToolTransitionBinding.for_tool(
 # missing the field load as schema 1 and infer `effect_id` from `request_id`
 # (see LedgerEntry.from_dict) — this is a read-time inference, not a storage
 # migration, so old rows keep working unchanged.
-LEDGER_ENTRY_SCHEMA_VERSION = 2
+LEDGER_ENTRY_SCHEMA_VERSION = 3
 
 
 def _read_ledger_entry_schema_version(data: Mapping[str, Any]) -> int:
@@ -282,6 +282,10 @@ class LedgerEntry:
     # without a fence load as 0.
     fence: int = 0
     result: Any = None
+    # Hashes permit drift checks without retaining the original call payload.
+    args_digest: str | None = None
+    args_alias_digest: str | None = None
+    result_retained: bool = True
     error: str | None = None
     started_at: float = field(default_factory=time.time)
     finished_at: float | None = None
@@ -417,6 +421,9 @@ class LedgerEntry:
             "terminal_outcome": self.terminal_outcome,
             "fence": self.fence,
             "result": self.result,
+            "args_digest": self.args_digest,
+            "args_alias_digest": self.args_alias_digest,
+            "result_retained": self.result_retained,
             "error": self.error,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
@@ -473,6 +480,9 @@ class LedgerEntry:
             terminal_outcome=terminal_outcome,
             fence=int(data.get("fence") or 0),
             result=data.get("result"),
+            args_digest=data.get("args_digest"),
+            args_alias_digest=data.get("args_alias_digest"),
+            result_retained=bool(data.get("result_retained", True)),
             error=data.get("error"),
             started_at=float(data.get("started_at", time.time())),
             finished_at=data.get("finished_at"),
