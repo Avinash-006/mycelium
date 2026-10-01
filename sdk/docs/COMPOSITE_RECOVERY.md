@@ -107,8 +107,35 @@ recovery, including when an explicit `definition` is supplied. The loop
 variable cannot be reassigned. This first loop slice cannot be combined with a
 branch in the same composite.
 
+A host may supply the bounded items at invocation time with the explicit
+`composite_items()` iterator:
+
+```python
+from mycelium import composite, composite_items
+
+@composite(storage)
+def publish_batch(operation_id: str, items: list[dict]):
+    for item in composite_items(items, max_items=32):
+        result = publish_one(
+            idempotency_key=f"{operation_id}:{item['id']}", item=item
+        )
+    return result
+```
+
+`items` must be a function argument containing a list of 1 to `max_items`
+faithfully JSON-serializable values. `max_items` is a literal integer from 1
+through 32. Before the first child effect, the decorator includes a digest of
+the ordered item values and loop definition in the durable parent manifest;
+the values themselves are not stored there. Replay requires the host to pass
+the same items in the same order. `composite_items()` checks the list again at
+loop entry and returns a copy, blocking a change made after preflight. Each
+iteration has its own ledger identity. Use a stable, distinct provider
+idempotency key per item, as shown with the host-supplied `id` field. The item
+list cannot be reassigned, and this slice does not support empty lists, nested
+loops, or a branch in the same composite.
+
 Multiple or nested conditions, short-circuit or conditional expressions,
-variable-length or nested loops, comprehensions, generators, nested calls such as `outer(inner())`,
+unbounded or nested loops, comprehensions, generators, nested calls such as `outer(inner())`,
 early returns, nested definitions, recursion, dynamic dispatch, nested
 composites, and unsupported/opaque boundaries are rejected before execution.
 This avoids inferring order by sorting every AST call by source location.

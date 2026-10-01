@@ -7,6 +7,9 @@ small PyPI versions. Pre-release checklist: [sdk/docs/RELEASE.md](sdk/docs/RELEA
 
 ### Added
 
+- Allow a Python composite to loop over 1–32 host-supplied JSON-compatible
+  items with `composite_items()`. Pin the ordered list fingerprint before child
+  effects and block changed items or order on replay.
 - Support one fixed-count `range(N)` loop in Python `@composite` workflows,
   pinning a distinct child identity for each of up to 32 iterations and
   resuming from the first unresolved iteration after a crash.
