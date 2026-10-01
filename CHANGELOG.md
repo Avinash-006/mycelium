@@ -20,6 +20,12 @@ small PyPI versions. Pre-release checklist: [sdk/docs/RELEASE.md](sdk/docs/RELEA
   pins manifests, scopes child identities to the parent, checks both fences,
   and replays completed children after a restart without changing `v1alpha1`.
 
+### Fixed
+
+- Reject a shadowed `range` argument or a changed closure/global binding
+  before executing a bounded composite loop, preserving its pinned iteration
+  schedule.
+
 ## 1.38.5 (2026-09-28)
 
 ### Added
