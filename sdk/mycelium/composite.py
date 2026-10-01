@@ -1,4 +1,4 @@
-"""Durable, straight-line composite effect recovery.
+"""Durable, bounded composite effect recovery.
 
 This module deliberately composes the existing action ledger.  A composite is
 not a transaction: the parent owns the manifest and execution fence while each
@@ -11,6 +11,7 @@ child remains an ordinary, independently reconcilable ledger entry.
 from __future__ import annotations
 
 import ast
+import builtins
 import functools
 import hashlib
 import inspect
@@ -102,6 +103,10 @@ class CompositeManifest:
 class _PreparedChild:
     step_id: str
     effect_id: str
+
+    def request_id(self, base_request_id: str) -> str:
+        identity = canonical_json({"effect_id": self.effect_id, "request_id": base_request_id})
+        return "mycelium:composite:request:v1:" + hashlib.sha256(identity.encode()).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -236,6 +241,7 @@ _UNSUPPORTED_EXECUTABLE_NODES = (
     ast.AsyncFunctionDef,
     ast.ClassDef,
 )
+_MAX_COMPOSITE_LOOP_ITERATIONS = 32
 
 
 def _function_body(func: Callable[..., Any], parsed: ast.Module) -> list[ast.stmt]:
@@ -352,6 +358,72 @@ def _input_branch_paths(
         [*body[:branch_index], *branch.orelse, *body[branch_index + 1:]],
         from_result,
     )
+
+
+def _bounded_loop_body(
+    func: Callable[..., Any], parsed: ast.Module
+) -> tuple[list[ast.stmt], str] | None:
+    body = _function_body(func, parsed)
+    loops = [(index, stmt) for index, stmt in enumerate(body) if isinstance(stmt, ast.For)]
+    if not loops:
+        return None
+    if len(loops) != 1:
+        raise CompositeUnsupportedError("composites support one top-level bounded loop")
+    loop_index, loop = loops[0]
+    iterator = loop.iter
+    if (
+        not isinstance(loop.target, ast.Name)
+        or not isinstance(iterator, ast.Call)
+        or not isinstance(iterator.func, ast.Name)
+        or iterator.func.id != "range"
+        or len(iterator.args) != 1
+        or iterator.keywords
+        or not isinstance(iterator.args[0], ast.Constant)
+        or type(iterator.args[0].value) is not int
+        or loop.orelse
+    ):
+        raise CompositeUnsupportedError(
+            "composite loop must be `for name in range(N)` with a literal integer N"
+        )
+    count = iterator.args[0].value
+    if not 1 <= count <= _MAX_COMPOSITE_LOOP_ITERATIONS:
+        raise CompositeUnsupportedError(
+            f"composite loop count must be between 1 and {_MAX_COMPOSITE_LOOP_ITERATIONS}"
+        )
+    closure = inspect.getclosurevars(func)
+    namespace = {**closure.globals, **closure.nonlocals, **getattr(func, "__globals__", {})}
+    if namespace.get("range", builtins.range) is not builtins.range:
+        raise CompositeUnsupportedError("composite loop requires the built-in range")
+    if any(
+        isinstance(node, ast.Name)
+        and node.id == "range"
+        and isinstance(node.ctx, (ast.Store, ast.Del))
+        for statement in body for node in ast.walk(statement)
+    ):
+        raise CompositeUnsupportedError("composite loop cannot reassign range")
+    for index, statement in enumerate(body):
+        if index == loop_index:
+            for loop_statement in loop.body:
+                _validate_statement(func, loop_statement)
+                if isinstance(loop_statement, ast.Return):
+                    raise CompositeUnsupportedError("composite loop cannot return early")
+                if any(
+                    isinstance(node, ast.Name)
+                    and node.id == loop.target.id
+                    and isinstance(node.ctx, (ast.Store, ast.Del))
+                    for node in ast.walk(loop_statement)
+                ):
+                    raise CompositeUnsupportedError("composite loop variable cannot be reassigned")
+        else:
+            _validate_statement(func, statement)
+            if isinstance(statement, ast.Return) and index != len(body) - 1:
+                raise CompositeUnsupportedError("composite cannot return before its final statement")
+    # The AST is expanded only for the manifest. Python executes the original
+    # loop, and the invocation cursor associates each pass with its own step.
+    expanded = [*body[:loop_index], *(loop.body * count), *body[loop_index + 1:]]
+    loop_shape = ast.dump(loop, annotate_fields=True, include_attributes=False)
+    path = "loop:" + hashlib.sha256(loop_shape.encode()).hexdigest()
+    return expanded, path
 
 
 def _direct_call(statement: ast.stmt) -> ast.Call | None:
@@ -982,8 +1054,12 @@ def composite(
                 f"cannot statically inspect {func.__qualname__}; keep the composite source inspectable"
             ) from exc
         branch_paths = _input_branch_paths(func, parsed)
+        loop_body = _bounded_loop_body(func, parsed) if branch_paths is None else None
         if branch_paths is None:
-            manifest = _build_manifest(func, definition)
+            manifest = (
+                _build_manifest(func, definition, body=loop_body[0], path=loop_body[1])
+                if loop_body is not None else _build_manifest(func, definition)
+            )
             branch_manifests = None
         else:
             argument = branch_paths.selector
