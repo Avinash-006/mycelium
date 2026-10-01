@@ -308,6 +308,7 @@
       "canonicalize_message_id",
       "composite",
       "composite_choice",
+      "composite_items",
       "compute_dttr",
       "compute_dttr_from_storage",
       "config_json_schema",

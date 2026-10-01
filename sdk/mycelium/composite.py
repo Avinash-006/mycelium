@@ -119,6 +119,19 @@ class _BranchPaths:
     from_result: bool
 
 
+@dataclass(frozen=True)
+class _ItemsLoop:
+    selector: str
+    max_items: int
+    body: list[ast.stmt]
+    loop: ast.For
+    index: int
+    shape: str
+
+    def expanded(self, count: int) -> list[ast.stmt]:
+        return [*self.body[:self.index], *(self.loop.body * count), *self.body[self.index + 1:]]
+
+
 def _owner() -> str:
     # Host and PID are useful diagnostics, but are not an ownership identity:
     # two invocations routinely share both.  The invocation token must remain
@@ -391,13 +404,26 @@ def _bounded_loop_body(
             f"composite loop count must be between 1 and {_MAX_COMPOSITE_LOOP_ITERATIONS}"
         )
     _require_builtin_range(func)
+    _validate_loop_statements(func, body, loop_index, loop, {"range"})
+    # The AST is expanded only for the manifest. Python executes the original
+    # loop, and the invocation cursor associates each pass with its own step.
+    expanded = [*body[:loop_index], *(loop.body * count), *body[loop_index + 1:]]
+    loop_shape = ast.dump(loop, annotate_fields=True, include_attributes=False)
+    path = "loop:" + hashlib.sha256(loop_shape.encode()).hexdigest()
+    return expanded, path
+
+
+def _validate_loop_statements(
+    func: Callable[..., Any], body: list[ast.stmt], loop_index: int,
+    loop: ast.For, protected: set[str],
+) -> None:
     if any(
         isinstance(node, ast.Name)
-        and node.id == "range"
+        and node.id in protected
         and isinstance(node.ctx, (ast.Store, ast.Del))
         for statement in body for node in ast.walk(statement)
     ):
-        raise CompositeUnsupportedError("composite loop cannot reassign range")
+        raise CompositeUnsupportedError("composite loop cannot reassign its iterator or input")
     for index, statement in enumerate(body):
         if index == loop_index:
             for loop_statement in loop.body:
@@ -415,12 +441,75 @@ def _bounded_loop_body(
             _validate_statement(func, statement)
             if isinstance(statement, ast.Return) and index != len(body) - 1:
                 raise CompositeUnsupportedError("composite cannot return before its final statement")
-    # The AST is expanded only for the manifest. Python executes the original
-    # loop, and the invocation cursor associates each pass with its own step.
-    expanded = [*body[:loop_index], *(loop.body * count), *body[loop_index + 1:]]
-    loop_shape = ast.dump(loop, annotate_fields=True, include_attributes=False)
-    path = "loop:" + hashlib.sha256(loop_shape.encode()).hexdigest()
-    return expanded, path
+
+
+def _items_loop_body(func: Callable[..., Any], parsed: ast.Module) -> _ItemsLoop | None:
+    body = _function_body(func, parsed)
+    loops = [(index, stmt) for index, stmt in enumerate(body) if isinstance(stmt, ast.For)]
+    if not loops:
+        return None
+    loop_index, loop = loops[0]
+    iterator = loop.iter
+    if not (
+        isinstance(iterator, ast.Call)
+        and isinstance(iterator.func, ast.Name)
+        and iterator.func.id == "composite_items"
+    ):
+        return None
+    if len(loops) != 1:
+        raise CompositeUnsupportedError("composites support one top-level bounded loop")
+    if (
+        not isinstance(loop.target, ast.Name)
+        or len(iterator.args) != 1
+        or not isinstance(iterator.args[0], ast.Name)
+        or len(iterator.keywords) != 1
+        or iterator.keywords[0].arg != "max_items"
+        or not isinstance(iterator.keywords[0].value, ast.Constant)
+        or type(iterator.keywords[0].value.value) is not int
+        or loop.orelse
+    ):
+        raise CompositeUnsupportedError(
+            "composite item loop must be `for item in composite_items(items, max_items=N)`"
+        )
+    selector = iterator.args[0].id
+    if selector not in inspect.signature(func).parameters:
+        raise CompositeUnsupportedError("composite item list must be a function argument")
+    maximum = iterator.keywords[0].value.value
+    if not 1 <= maximum <= _MAX_COMPOSITE_LOOP_ITERATIONS:
+        raise CompositeUnsupportedError("composite item limit must be between 1 and 32")
+    _require_composite_items_binding(func)
+    _validate_loop_statements(
+        func, body, loop_index, loop, {selector, "composite_items"}
+    )
+    shape = ast.dump(loop, annotate_fields=True, include_attributes=False)
+    return _ItemsLoop(selector, maximum, body, loop, loop_index, shape)
+
+
+def _require_composite_items_binding(func: Callable[..., Any]) -> None:
+    if "composite_items" in inspect.signature(func).parameters:
+        raise CompositeUnsupportedError("composite item loop cannot bind its iterator as an argument")
+    closure = inspect.getclosurevars(func)
+    value = closure.nonlocals.get(
+        "composite_items",
+        closure.globals.get(
+            "composite_items", getattr(func, "__globals__", {}).get("composite_items")
+        ),
+    )
+    if value is not composite_items:
+        raise CompositeUnsupportedError("composite item loop requires composite_items()")
+
+
+def _serialize_composite_items(value: Any, maximum: int) -> str:
+    if type(value) is not list or not 1 <= len(value) <= maximum:
+        raise CompositeUnsupportedError(f"composite items must be a list of 1 to {maximum} items")
+    try:
+        encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        restored = json.loads(encoded)
+    except (TypeError, ValueError) as exc:
+        raise CompositeUnsupportedError("composite items must be faithfully JSON serializable") from exc
+    if value != restored:
+        raise CompositeUnsupportedError("composite items must be faithfully JSON serializable")
+    return encoded
 
 
 def _require_builtin_range(func: Callable[..., Any]) -> None:
@@ -843,6 +932,14 @@ def composite_choice(value: bool) -> bool:
     return active.select_result_path(value)
 
 
+def composite_items(items: list[Any], *, max_items: int) -> list[Any]:
+    """Replay a bounded, pinned host list inside a composite loop."""
+    active = get_active_composite()
+    if active is None:
+        raise CompositeUnsupportedError("composite_items() requires an active composite")
+    return active.iter_items(items, max_items=max_items)
+
+
 class CompositeInvocation(AbstractContextManager["CompositeInvocation"]):
     def __init__(
         self,
@@ -855,6 +952,8 @@ class CompositeInvocation(AbstractContextManager["CompositeInvocation"]):
         renewal_interval: float | None = None,
         result_manifests: dict[bool, CompositeManifest] | None = None,
         result_inverted: bool = False,
+        items_snapshot: str | None = None,
+        items_limit: int | None = None,
     ) -> None:
         if lease_ttl <= 0:
             raise CompositeUnsupportedError("composite lease_ttl must be positive")
@@ -867,6 +966,9 @@ class CompositeInvocation(AbstractContextManager["CompositeInvocation"]):
         self.result_manifests = result_manifests
         self.result_inverted = result_inverted
         self._path_selected = False
+        self.items_snapshot = items_snapshot
+        self.items_limit = items_limit
+        self._items_consumed = False
         self.owner = _owner()
         self.lease_ttl = lease_ttl
         self.renewal_interval = renewal_interval
@@ -902,6 +1004,16 @@ class CompositeInvocation(AbstractContextManager["CompositeInvocation"]):
         self.manifest = selected
         self._path_selected = True
         return value
+
+    def iter_items(self, items: list[Any], *, max_items: int) -> list[Any]:
+        if self.items_snapshot is None or self.items_limit != max_items:
+            raise CompositeUnsupportedError("this composite has no matching bounded item loop")
+        if self._items_consumed:
+            raise CompositeDefinitionDriftError("composite item loop was entered more than once")
+        if _serialize_composite_items(items, max_items) != self.items_snapshot:
+            raise CompositeDefinitionDriftError("composite item list changed before its loop")
+        self._items_consumed = True
+        return cast(list[Any], json.loads(self.items_snapshot))
 
     def _start_renewal(self) -> None:
         if (
@@ -958,6 +1070,8 @@ class CompositeInvocation(AbstractContextManager["CompositeInvocation"]):
             if exc is None:
                 if self._renewal_error is not None:
                     raise self._renewal_error
+                if self.items_snapshot is not None and not self._items_consumed:
+                    raise CompositeDefinitionDriftError("composite item loop was not entered")
                 self.store.finish(
                     self.key,
                     self.owner,
@@ -1064,12 +1178,20 @@ def composite(
                 f"cannot statically inspect {func.__qualname__}; keep the composite source inspectable"
             ) from exc
         branch_paths = _input_branch_paths(func, parsed)
-        loop_body = _bounded_loop_body(func, parsed) if branch_paths is None else None
+        items_loop = _items_loop_body(func, parsed) if branch_paths is None else None
+        loop_body = (
+            _bounded_loop_body(func, parsed)
+            if branch_paths is None and items_loop is None else None
+        )
         if branch_paths is None:
-            manifest = (
-                _build_manifest(func, definition, body=loop_body[0], path=loop_body[1])
-                if loop_body is not None else _build_manifest(func, definition)
-            )
+            if items_loop is not None:
+                _build_manifest(func, definition, body=items_loop.expanded(1), path="items:preflight")
+                manifest = None
+            else:
+                manifest = (
+                    _build_manifest(func, definition, body=loop_body[0], path=loop_body[1])
+                    if loop_body is not None else _build_manifest(func, definition)
+                )
             branch_manifests = None
         else:
             argument = branch_paths.selector
@@ -1114,12 +1236,28 @@ def composite(
                     return copied
             return kwargs
 
-        def selected_manifest(args: tuple[Any, ...], kwargs: dict[str, Any]) -> CompositeManifest:
+        def selected_manifest(
+            args: tuple[Any, ...], kwargs: dict[str, Any]
+        ) -> tuple[CompositeManifest, str | None, int | None]:
+            if items_loop is not None:
+                _require_composite_items_binding(func)
+                bound = inspect.signature(func).bind(*args, **call_kwargs(kwargs))
+                bound.apply_defaults()
+                snapshot = _serialize_composite_items(
+                    bound.arguments.get(items_loop.selector), items_loop.max_items
+                )
+                path_identity = canonical_json({"shape": items_loop.shape, "items": json.loads(snapshot)})
+                path = "items:" + hashlib.sha256(path_identity.encode()).hexdigest()
+                selected = _build_manifest(
+                    func, definition,
+                    body=items_loop.expanded(len(json.loads(snapshot))), path=path,
+                )
+                return selected, snapshot, items_loop.max_items
             if branch_paths is None or branch_paths.from_result:
                 assert manifest is not None
                 if loop_body is not None:
                     _require_builtin_range(func)
-                return manifest
+                return manifest, None, None
             assert branch_manifests is not None
             argument, inverted = branch_paths.selector, branch_paths.inverted
             bound = inspect.signature(func).bind(*args, **call_kwargs(kwargs))
@@ -1129,15 +1267,16 @@ def composite(
                 raise CompositeUnsupportedError(
                     f"composite branch argument {argument!r} must be a bool"
                 )
-            return branch_manifests[value != inverted]
+            return branch_manifests[value != inverted], None, None
 
         if inspect.iscoroutinefunction(func):
             @functools.wraps(func)
             async def async_wrapper(*args: Any, **kwargs: Any) -> R:
+                selected, items_snapshot, items_limit = selected_manifest(args, kwargs)
                 with CompositeInvocation(
                     storage,
                     operation_id(args, kwargs),
-                    selected_manifest(args, kwargs),
+                    selected,
                     namespace=namespace,
                     lease_ttl=lease_ttl,
                     renewal_interval=renewal_interval,
@@ -1145,6 +1284,8 @@ def composite(
                         branch_manifests if branch_paths is not None and branch_paths.from_result else None
                     ),
                     result_inverted=branch_paths.inverted if branch_paths is not None else False,
+                    items_snapshot=items_snapshot,
+                    items_limit=items_limit,
                 ):
                     result = await func(*args, **call_kwargs(kwargs))
                     active = get_active_composite()
@@ -1159,10 +1300,11 @@ def composite(
 
         @functools.wraps(func)
         def sync_wrapper(*args: Any, **kwargs: Any) -> R:
+            selected, items_snapshot, items_limit = selected_manifest(args, kwargs)
             with CompositeInvocation(
                 storage,
                 operation_id(args, kwargs),
-                selected_manifest(args, kwargs),
+                selected,
                 namespace=namespace,
                 lease_ttl=lease_ttl,
                 renewal_interval=renewal_interval,
@@ -1170,6 +1312,8 @@ def composite(
                     branch_manifests if branch_paths is not None and branch_paths.from_result else None
                 ),
                 result_inverted=branch_paths.inverted if branch_paths is not None else False,
+                items_snapshot=items_snapshot,
+                items_limit=items_limit,
             ):
                 result = func(*args, **call_kwargs(kwargs))
                 active = get_active_composite()
@@ -1194,6 +1338,7 @@ __all__ = [
     "CompositeUnsupportedError",
     "composite",
     "composite_choice",
+    "composite_items",
     "get_active_composite",
     "register_composite_boundary",
     "register_composite_helper",
