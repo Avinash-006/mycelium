@@ -390,10 +390,7 @@ def _bounded_loop_body(
         raise CompositeUnsupportedError(
             f"composite loop count must be between 1 and {_MAX_COMPOSITE_LOOP_ITERATIONS}"
         )
-    closure = inspect.getclosurevars(func)
-    namespace = {**closure.globals, **closure.nonlocals, **getattr(func, "__globals__", {})}
-    if namespace.get("range", builtins.range) is not builtins.range:
-        raise CompositeUnsupportedError("composite loop requires the built-in range")
+    _require_builtin_range(func)
     if any(
         isinstance(node, ast.Name)
         and node.id == "range"
@@ -424,6 +421,19 @@ def _bounded_loop_body(
     loop_shape = ast.dump(loop, annotate_fields=True, include_attributes=False)
     path = "loop:" + hashlib.sha256(loop_shape.encode()).hexdigest()
     return expanded, path
+
+
+def _require_builtin_range(func: Callable[..., Any]) -> None:
+    # A parameter or mutable closure/global can shadow the apparently literal
+    # range(N), changing item values without changing the pinned manifest.
+    if "range" in inspect.signature(func).parameters:
+        raise CompositeUnsupportedError("composite loop cannot bind range as an argument")
+    closure = inspect.getclosurevars(func)
+    value = closure.nonlocals.get(
+        "range", closure.globals.get("range", getattr(func, "__globals__", {}).get("range", builtins.range))
+    )
+    if value is not builtins.range:
+        raise CompositeUnsupportedError("composite loop requires the built-in range")
 
 
 def _direct_call(statement: ast.stmt) -> ast.Call | None:
@@ -1107,6 +1117,8 @@ def composite(
         def selected_manifest(args: tuple[Any, ...], kwargs: dict[str, Any]) -> CompositeManifest:
             if branch_paths is None or branch_paths.from_result:
                 assert manifest is not None
+                if loop_body is not None:
+                    _require_builtin_range(func)
                 return manifest
             assert branch_manifests is not None
             argument, inverted = branch_paths.selector, branch_paths.inverted

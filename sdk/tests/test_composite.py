@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import builtins
 import json
 import os
 import subprocess
@@ -188,6 +189,38 @@ def test_bounded_loop_rejects_unpinned_or_unbounded_shapes(tmp_path) -> None:
                 for inner in range(2):
                     result = effect(idempotency_key=f"{index}:{inner}")
             return result
+
+
+def test_bounded_loop_rejects_shadowed_range_before_child_effect(tmp_path) -> None:
+    storage = SqliteLedgerStorage(tmp_path / "ledger.sqlite")
+    calls: list[int] = []
+
+    @ledger_sync(storage=storage, transition_binding=_binding())
+    def effect(idempotency_key: str, index: int) -> int:
+        with side_effect():
+            calls.append(index)
+        return index
+
+    with pytest.raises(CompositeUnsupportedError, match="cannot bind range as an argument"):
+
+        @composite(storage)
+        def parameter(operation_id: str, range) -> int:
+            for index in range(2):
+                result = effect(idempotency_key=f"{operation_id}:{index}", index=index)
+            return result
+
+    range = builtins.range
+
+    @composite(storage)
+    def mutable_closure(operation_id: str) -> int:
+        for index in range(2):
+            result = effect(idempotency_key=f"{operation_id}:{index}", index=index)
+        return result
+
+    range = lambda count: (7, 8)  # noqa: E731
+    with pytest.raises(CompositeUnsupportedError, match="built-in range"):
+        mutable_closure(operation_id="shadowed")
+    assert calls == []
 
 
 def test_bounded_loop_pins_shape_with_explicit_definition(tmp_path) -> None:
