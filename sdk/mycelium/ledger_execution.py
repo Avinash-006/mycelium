@@ -399,6 +399,8 @@ def _run_ledgered(
         transition_binding=transition_binding,
         identity_kwargs=identity_kwargs,
     )
+    if composite_child is not None:
+        request_id = composite_child.request_id(request_id)
     clean_kwargs = _drop_ledger_keys(kwargs)
     claim_kwargs = _claim_kwargs(kwargs, clean_kwargs)
     _outcome_reexec_authorized.set(False)
@@ -799,6 +801,8 @@ async def _run_ledgered_async(
         transition_binding=transition_binding,
         identity_kwargs=identity_kwargs,
     )
+    if composite_child is not None:
+        request_id = composite_child.request_id(request_id)
     clean_kwargs = _drop_ledger_keys(kwargs)
     claim_kwargs = _claim_kwargs(kwargs, clean_kwargs)
     _outcome_reexec_authorized.set(False)

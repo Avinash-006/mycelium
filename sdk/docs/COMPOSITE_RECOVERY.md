@@ -85,8 +85,30 @@ continues with stored child results. A changed choice blocks. The check must
 be assigned immediately before the `if`; direct reads and mutable external
 facts cannot determine a replayable branch.
 
+One top-level fixed-count loop is also supported:
+
+```python
+@composite(storage)
+def publish_batch(operation_id: str):
+    for index in range(3):
+        result = publish_one(idempotency_key=f"{operation_id}:{index}", index=index)
+    return result
+```
+
+The `range(N)` count must be a literal integer from 1 through 32, and `range`
+must be the built-in. Mycelium expands the loop into a pinned ordered manifest
+before the first effect. Every iteration has a distinct child and request
+identity, even when it calls the same tool with otherwise identical arguments.
+Use a distinct provider idempotency key for each iteration when the provider
+supports one; the ledger's child identity does not change provider key semantics.
+On replay, completed iterations return stored results and execution continues
+at the first unresolved iteration. Changing the loop shape or count blocks
+recovery, including when an explicit `definition` is supplied. The loop
+variable cannot be reassigned. This first loop slice cannot be combined with a
+branch in the same composite.
+
 Multiple or nested conditions, short-circuit or conditional expressions,
-loops, comprehensions, generators, nested calls such as `outer(inner())`,
+variable-length or nested loops, comprehensions, generators, nested calls such as `outer(inner())`,
 early returns, nested definitions, recursion, dynamic dispatch, nested
 composites, and unsupported/opaque boundaries are rejected before execution.
 This avoids inferring order by sorting every AST call by source location.

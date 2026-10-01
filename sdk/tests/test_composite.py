@@ -29,7 +29,7 @@ from mycelium import (
     side_effect,
     side_effect_async,
 )
-from mycelium.composite import CompositeInvocation, _ControlStore
+from mycelium.composite import CompositeInvocation, _ControlStore, _PreparedChild
 
 
 def _binding() -> ToolTransitionBinding:
@@ -106,6 +106,162 @@ def test_composite_rejects_unsupported_control_flow(tmp_path) -> None:
             if operation_id:
                 return effect(idempotency_key="x")
             return effect(idempotency_key="y")
+
+
+def test_bounded_loop_resumes_each_iteration_without_repeating_effects(tmp_path) -> None:
+    storage = SqliteLedgerStorage(tmp_path / "ledger.sqlite")
+    calls: list[int] = []
+    crash = {"enabled": True}
+
+    @ledger_sync(storage=storage, transition_binding=_binding())
+    def effect(idempotency_key: str, index: int) -> int:
+        with side_effect():
+            calls.append(index)
+        return index
+
+    def crash_before_third(index: int) -> None:
+        if index == 2 and crash["enabled"]:
+            raise RuntimeError("simulated loop crash")
+
+    register_composite_helper(crash_before_third)
+
+    @composite(storage)
+    def batch(operation_id: str) -> int:
+        for index in range(3):
+            crash_before_third(index)
+            result = effect(idempotency_key=f"{operation_id}:{index}", index=index)
+        return result
+
+    with pytest.raises(RuntimeError, match="simulated loop crash"):
+        batch(operation_id="batch-1")
+    assert calls == [0, 1]
+    crash["enabled"] = False
+    assert batch(operation_id="batch-1") == 2
+    assert calls == [0, 1, 2]
+    assert batch(operation_id="batch-1") == 2
+    assert calls == [0, 1, 2]
+
+    records = json.loads((tmp_path / "ledger.sqlite.composites.json").read_text())
+    record = records["mycelium:batch-1"]
+    steps = record["manifest"]["steps"]
+    assert len(steps) == len({step["step_id"] for step in steps}) == 3
+    assert record["status"] == "COMPLETED"
+
+
+def test_bounded_loop_rejects_unpinned_or_unbounded_shapes(tmp_path) -> None:
+    storage = SqliteLedgerStorage(tmp_path / "ledger.sqlite")
+
+    @ledger_sync(storage=storage, transition_binding=_binding())
+    def effect(idempotency_key: str) -> str:
+        return "ok"
+
+    with pytest.raises(CompositeUnsupportedError, match="literal integer"):
+
+        @composite(storage)
+        def dynamic(operation_id: str, count: int) -> str:
+            for index in range(count):
+                result = effect(idempotency_key=str(index))
+            return result
+
+    with pytest.raises(CompositeUnsupportedError, match="between 1 and 32"):
+
+        @composite(storage)
+        def too_many(operation_id: str) -> str:
+            for index in range(33):
+                result = effect(idempotency_key=str(index))
+            return result
+
+    with pytest.raises(CompositeUnsupportedError, match="loop variable cannot be reassigned"):
+
+        @composite(storage)
+        def reassigned(operation_id: str) -> str:
+            for index in range(2):
+                index = 5
+                result = effect(idempotency_key=str(index))
+            return result
+
+    with pytest.raises(CompositeUnsupportedError, match="unsupported executable syntax"):
+
+        @composite(storage)
+        def nested(operation_id: str) -> str:
+            for index in range(2):
+                for inner in range(2):
+                    result = effect(idempotency_key=f"{index}:{inner}")
+            return result
+
+
+def test_bounded_loop_pins_shape_with_explicit_definition(tmp_path) -> None:
+    storage = SqliteLedgerStorage(tmp_path / "ledger.sqlite")
+    calls: list[str] = []
+
+    @ledger_sync(storage=storage, transition_binding=_binding())
+    def effect(idempotency_key: str) -> str:
+        with side_effect():
+            calls.append(idempotency_key)
+        return idempotency_key
+
+    @composite(storage, definition="batch-v1")
+    def batch(operation_id: str) -> str:
+        for index in range(2):
+            result = effect(idempotency_key=f"{operation_id}:{index}")
+        return result
+
+    assert batch(operation_id="batch-1") == "batch-1:1"
+
+    @composite(storage, definition="batch-v1")
+    def batch(operation_id: str) -> str:
+        for index in range(3):
+            result = effect(idempotency_key=f"{operation_id}:{index}")
+        return result
+
+    with pytest.raises(CompositeDefinitionDriftError):
+        batch(operation_id="batch-1")
+    assert calls == ["batch-1:0", "batch-1:1"]
+
+
+async def test_async_bounded_loop_uses_distinct_child_steps(tmp_path) -> None:
+    storage = SqliteLedgerStorage(tmp_path / "ledger.sqlite")
+    calls: list[int] = []
+
+    @ledger(storage=storage, transition_binding=_binding())
+    async def effect(idempotency_key: str, index: int) -> int:
+        async with side_effect_async():
+            calls.append(index)
+        return index
+
+    @composite(storage)
+    async def batch(operation_id: str) -> int:
+        for index in range(2):
+            result = await effect(idempotency_key=f"{operation_id}:{index}", index=index)
+        return result
+
+    assert await batch(operation_id="async-batch") == 1
+    assert await batch(operation_id="async-batch") == 1
+    assert calls == [0, 1]
+
+
+def test_existing_composite_child_replays_after_request_identity_change(
+    tmp_path, monkeypatch
+) -> None:
+    storage = SqliteLedgerStorage(tmp_path / "ledger.sqlite")
+    calls: list[str] = []
+
+    @ledger_sync(storage=storage, transition_binding=_binding())
+    def effect(idempotency_key: str) -> str:
+        with side_effect():
+            calls.append(idempotency_key)
+        return idempotency_key
+
+    @composite(storage)
+    def single(operation_id: str) -> str:
+        return effect(idempotency_key=f"{operation_id}:effect")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(_PreparedChild, "request_id", lambda self, base: base)
+        assert single(operation_id="legacy") == "legacy:effect"
+
+    assert single(operation_id="legacy") == "legacy:effect"
+    assert calls == ["legacy:effect"]
 
 
 def test_input_boolean_branch_pins_path_and_replays_only_selected_children(tmp_path) -> None:
