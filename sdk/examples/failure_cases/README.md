@@ -1,4 +1,4 @@
-# Failure-case pack (AF-002 gates)
+# Failure-case examples: in-process repros of the resolution gates
 
 Teachable, **in-process** repros for Mycelium resolution gates. No Redis or
 Postgres required — memory ledger only.
