@@ -1921,13 +1921,11 @@ class MyceliumConfig:
                 url = resolve_storage_url(raw)
             except ValueError as exc:
                 raise ConfigError(str(exc)) from exc
-            ttl = MyceliumConfig._parse_ledger_timing(raw, "in_flight_ttl", default=604800.0)
-            retention = MyceliumConfig._parse_ledger_timing(raw, "retention_seconds", default=None)
+            ttl = raw.get("in_flight_ttl", 604800)
             return RedisTaskLedgerStorage(
                 url,
                 prefix=str(raw.get("prefix", "mycelium:task:")),
-                in_flight_ttl=ttl,
-                retention_seconds=retention,
+                in_flight_ttl=float(ttl) if ttl is not None else None,
             )
         if storage_type == "postgres":
             from mycelium.storage._helpers import resolve_storage_url

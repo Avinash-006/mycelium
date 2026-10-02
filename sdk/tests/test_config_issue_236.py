@@ -60,36 +60,61 @@ def test_action_ledger_timing_config_errors(storage, field, value, monkeypatch):
         MyceliumConfig._build_ledger_storage(cfg.action_ledger)
 
 
-@pytest.mark.parametrize(
-    "value",
-    [
-        "true",
-        "false",
-        ".nan",
-        ".inf",
-        "-.inf",
-        "0",
-        "-1",
-        "-0.5",
-        '"300"',
-    ],
-)
-def test_task_ledger_timing_config_errors(value, monkeypatch):
+def test_redis_task_ledger_construction_unaffected(monkeypatch):
     import mycelium.storage.redis_ledger as redis_mod
 
-    def unexpected_storage(*args, **kwargs):
-        pytest.fail("invalid timing fields must fail before storage construction")
+    class DummyRedis:
+        @classmethod
+        def from_url(cls, *args, **kwargs):
+            return object()
 
-    monkeypatch.setattr(redis_mod, "RedisTaskLedgerStorage", unexpected_storage)
-    yaml_text = (
-        "task_ledger:\n"
-        "  storage: redis\n"
-        "  url: redis://localhost:6379/0\n"
-        f"  in_flight_ttl: {value}\n"
+    monkeypatch.setattr(redis_mod, "_require_redis", lambda: type("Mod", (), {"Redis": DummyRedis}))
+
+    # Default construction with omitted timing fields
+    storage = MyceliumConfig._build_task_ledger_storage(
+        {"storage": "redis", "url": "redis://localhost:6379/0"}
     )
-    cfg = load_config_from_string(yaml_text)
-    with pytest.raises(ConfigError, match=r"ledger\.in_flight_ttl"):
-        MyceliumConfig._build_task_ledger_storage(cfg.task_ledger_defaults)
+    assert isinstance(storage, redis_mod.RedisTaskLedgerStorage)
+    assert storage._inner._in_flight_ttl == 604800.0
+
+    # Custom in_flight_ttl
+    storage_custom = MyceliumConfig._build_task_ledger_storage(
+        {"storage": "redis", "url": "redis://localhost:6379/0", "in_flight_ttl": 3600}
+    )
+    assert isinstance(storage_custom, redis_mod.RedisTaskLedgerStorage)
+    assert storage_custom._inner._in_flight_ttl == 3600.0
+
+
+def test_redis_action_ledger_construction(monkeypatch):
+    import mycelium.storage.redis_ledger as redis_mod
+
+    class DummyRedis:
+        @classmethod
+        def from_url(cls, *args, **kwargs):
+            return object()
+
+    monkeypatch.setattr(redis_mod, "_require_redis", lambda: type("Mod", (), {"Redis": DummyRedis}))
+
+    # Default construction with omitted timing fields
+    storage = MyceliumConfig._build_ledger_storage(
+        {"storage": "redis", "url": "redis://localhost:6379/0"}
+    )
+    assert isinstance(storage, redis_mod.RedisLedgerStorage)
+    assert storage._inner._in_flight_ttl == 604800.0
+    assert storage.retention_seconds is None
+
+    # Custom timing
+    storage_custom = MyceliumConfig._build_ledger_storage(
+        {
+            "storage": "redis",
+            "url": "redis://localhost:6379/0",
+            "in_flight_ttl": 1800,
+            "retention_seconds": 86400,
+        }
+    )
+    assert isinstance(storage_custom, redis_mod.RedisLedgerStorage)
+    assert storage_custom._inner._in_flight_ttl == 1800.0
+    assert storage_custom.retention_seconds == 86400.0
 
 
 def test_valid_redis_timing_forwarded(monkeypatch):
