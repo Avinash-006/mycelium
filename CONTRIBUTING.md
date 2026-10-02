@@ -336,6 +336,7 @@ Maintainers may squash commits when merging.
 ## Review and conduct
 
 Be direct, respectful, and evidence-led. Critique code and claims, not people.
+See the [Code of Conduct](CODE_OF_CONDUCT.md) for the community standards.
 Assume good intent, answer questions clearly, and update the pull request when
 the evidence changes.
 
