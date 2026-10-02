@@ -141,6 +141,8 @@ Defaults and allowlist for tool-level durable execution.
 | `on_args_drift` | `"soft" \| "hard" \| "off"` | `null` | — |
 | `missing_run_id_policy` | `"warn" \| "error" \| null` | `null` | — |
 | `payload_policy` | `LedgerPayloadPolicyModel \| null` | `null` | — |
+| `in_flight_ttl` | `number \| null` | `604800.0` | Primary-key TTL in seconds for Redis in-flight recovery; must be a finite number > 0 |
+| `retention_seconds` | `number \| null` | `null` | Prune retention window in seconds for Redis and PostgreSQL; must be a finite number > 0 |
 
 ## LedgerPayloadPolicyModel
 
@@ -223,6 +225,8 @@ Defaults and allowlist for task-level durable execution.
 | `dsn` | `string \| null` | `null` | — |
 | `dsn_env` | `string \| null` | `null` | — |
 | `tasks` | `"all" \| array[string] \| null` | `null` | — |
+| `in_flight_ttl` | `number \| null` | `604800.0` | Primary-key TTL in seconds for Redis in-flight recovery; must be a finite number > 0 |
+| `retention_seconds` | `number \| null` | `null` | Prune retention window in seconds for Redis; must be a finite number > 0 |
 
 ## Tool
 
