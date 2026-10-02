@@ -2224,6 +2224,8 @@ def _parse_config(
     if state_flush_raw is not None and not isinstance(state_flush_raw, dict):
         raise ConfigError("'state_flush' must be a mapping")
     if state_flush_raw is not None:
+        if not isinstance(state_flush_raw.get("flush_on_complete", True), bool):
+            raise ConfigError("'state_flush.flush_on_complete' must be a bool")
         storage_type = state_flush_raw.get("storage")
         if storage_type not in (None, "memory", "file", "redis", "postgres", "shared"):
             raise ConfigError(f"unknown state_flush storage type: {storage_type!r}")

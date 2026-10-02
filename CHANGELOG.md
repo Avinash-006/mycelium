@@ -33,6 +33,7 @@ small PyPI versions. Pre-release checklist: [sdk/docs/RELEASE.md](sdk/docs/RELEA
   fields with field-specific configuration errors.
 - Reject non-finite destructive grant TTLs with a field-specific configuration error.
 - Require a real boolean for `message_validator.enabled` instead of coercing strings.
+- Require a real boolean for `state_flush.flush_on_complete` before building storage.
 - Reject boolean `budget.warn_at` values instead of interpreting `true` as a
   warning threshold of `1.0`.
 - Reject a shadowed `range` argument or a changed closure/global binding
