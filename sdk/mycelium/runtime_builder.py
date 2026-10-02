@@ -265,6 +265,7 @@ _GUARD_MARKERS = (
     "_mycelium_langgraph_integration",
 )
 
+
 def _import_callable(callable_path: str, *, kind: str) -> Callable[..., Any]:
     module_name, attribute = callable_path.split(":", 1)
     try:
@@ -673,7 +674,9 @@ class MyceliumConfig:
             ledger_kwargs["on_args_drift"] = on_args_drift
             payload_config = action_ledger_cfg.get("payload_policy", {})
             if not isinstance(payload_config, dict) or set(payload_config) - {
-                "store_args", "store_result", "redact_fields"
+                "store_args",
+                "store_result",
+                "redact_fields",
             }:
                 raise ConfigError("'action_ledger.payload_policy' has invalid fields")
             try:
@@ -1821,6 +1824,28 @@ class MyceliumConfig:
         return emitter
 
     @staticmethod
+    def _parse_ledger_timing(
+        raw: dict[str, Any],
+        field: str,
+        *,
+        default: float | None = None,
+        prefix: str = "ledger",
+    ) -> float | None:
+        if field not in raw:
+            return default
+        value = raw[field]
+        if value is None:
+            return None
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise ConfigError(f"'{prefix}.{field}' must be a finite number > 0")
+        return float(value)
+
+    @staticmethod
     def _build_ledger_storage(raw: dict[str, Any]) -> LedgerStorage:
         """Build a LedgerStorage from tool ledger config."""
         storage_type = raw.get("storage", "memory")
@@ -1839,13 +1864,13 @@ class MyceliumConfig:
                 url = resolve_storage_url(raw)
             except ValueError as exc:
                 raise ConfigError(str(exc)) from exc
-            ttl = raw.get("in_flight_ttl", 604800)
-            retention = raw.get("retention_seconds")
+            ttl = MyceliumConfig._parse_ledger_timing(raw, "in_flight_ttl", default=604800.0)
+            retention = MyceliumConfig._parse_ledger_timing(raw, "retention_seconds", default=None)
             return RedisLedgerStorage(
                 url,
                 prefix=str(raw.get("prefix", "mycelium:action:")),
-                in_flight_ttl=float(ttl) if ttl is not None else None,
-                retention_seconds=float(retention) if retention is not None else None,
+                in_flight_ttl=ttl,
+                retention_seconds=retention,
             )
         if storage_type == "postgres":
             from mycelium.storage._helpers import resolve_storage_url
@@ -1855,16 +1880,13 @@ class MyceliumConfig:
                 dsn = resolve_storage_url(raw, url_key="dsn")
             except ValueError as exc:
                 raise ConfigError(str(exc)) from exc
+            retention = MyceliumConfig._parse_ledger_timing(raw, "retention_seconds", default=None)
             return PostgresLedgerStorage(
                 dsn,
                 table=str(raw.get("table", "mycelium_action_ledger")),
                 pool_min_size=int(raw.get("pool_min_size", 1)),
                 pool_max_size=int(raw.get("pool_max_size", 10)),
-                retention_seconds=(
-                    float(raw["retention_seconds"])
-                    if raw.get("retention_seconds") is not None
-                    else None
-                ),
+                retention_seconds=retention,
             )
         if storage_type == "sqlite":
             from mycelium.storage.sqlite_ledger import SqliteLedgerStorage
@@ -2114,6 +2136,7 @@ class _NoopRun:
 
     def __exit__(self, *_: Any) -> bool:
         return False
+
 
 # Preserve the historical qualified name for compatibility and pickling.
 MyceliumConfig.__module__ = "mycelium.config"

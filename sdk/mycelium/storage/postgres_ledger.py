@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
 from collections.abc import Callable
@@ -73,6 +74,15 @@ class PostgresEntryStorage:
             raise ValueError("Postgres pool sizes must satisfy 0 <= min_size <= max_size")
         self._pool_min_size = pool_min_size
         self._pool_max_size = pool_max_size
+        if retention_seconds is not None:
+            if (
+                isinstance(retention_seconds, bool)
+                or not isinstance(retention_seconds, (int, float))
+                or not math.isfinite(retention_seconds)
+                or retention_seconds <= 0
+            ):
+                raise ValueError("retention_seconds must be a finite number > 0")
+            retention_seconds = float(retention_seconds)
         self.retention_seconds = retention_seconds
         if connect_timeout <= 0 or pool_timeout <= 0:
             raise ValueError("Postgres timeouts must be positive")

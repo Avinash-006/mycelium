@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from collections.abc import Callable
 from dataclasses import replace
@@ -43,6 +44,24 @@ class RedisEntryStorage:
         in_flight_ttl: float | None = 604800.0,
         retention_seconds: float | None = None,
     ) -> None:
+        if in_flight_ttl is not None:
+            if (
+                isinstance(in_flight_ttl, bool)
+                or not isinstance(in_flight_ttl, (int, float))
+                or not math.isfinite(in_flight_ttl)
+                or in_flight_ttl <= 0
+            ):
+                raise ValueError("in_flight_ttl must be a finite number > 0")
+            in_flight_ttl = float(in_flight_ttl)
+        if retention_seconds is not None:
+            if (
+                isinstance(retention_seconds, bool)
+                or not isinstance(retention_seconds, (int, float))
+                or not math.isfinite(retention_seconds)
+                or retention_seconds <= 0
+            ):
+                raise ValueError("retention_seconds must be a finite number > 0")
+            retention_seconds = float(retention_seconds)
         redis = _require_redis()
         self._client = redis.Redis.from_url(url, decode_responses=True)
         self._prefix = prefix
