@@ -32,6 +32,7 @@ small PyPI versions. Pre-release checklist: [sdk/docs/RELEASE.md](sdk/docs/RELEA
   for action and task ledger `retention_seconds` and `in_flight_ttl` timing
   fields with field-specific configuration errors.
 - Reject non-finite destructive grant TTLs with a field-specific configuration error.
+- Require a real boolean for `message_validator.enabled` instead of coercing strings.
 - Reject boolean `budget.warn_at` values instead of interpreting `true` as a
   warning threshold of `1.0`.
 - Reject a shadowed `range` argument or a changed closure/global binding
