@@ -701,7 +701,11 @@ class BudgetGuard:
                 f"missing_usage_policy must be one of "
                 f"{sorted(MISSING_USAGE_POLICIES)}, got {missing_usage_policy!r}"
             )
-        if not 0.0 < warn_at <= 1.0:
+        if (
+            isinstance(warn_at, bool)
+            or not math.isfinite(warn_at)
+            or not 0.0 < warn_at <= 1.0
+        ):
             raise ValueError("warn_at must be in (0, 1]")
         if ceilings is None:
             duration = (

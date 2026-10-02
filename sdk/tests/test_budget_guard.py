@@ -423,3 +423,12 @@ def test_already_resolved_after_abort() -> None:
             by="ops",
             reason="retry",
         )
+
+
+@pytest.mark.parametrize(
+    "invalid_warn_at",
+    [True, False, float("nan"), float("inf"), float("-inf"), 0.0, 1.5, -0.1],
+)
+def test_budget_guard_warn_at_invalid_rejected(invalid_warn_at) -> None:
+    with pytest.raises(ValueError, match="warn_at must be in"):
+        BudgetGuard(InMemoryBudgetGuardStorage(), max_steps=5, warn_at=invalid_warn_at)
