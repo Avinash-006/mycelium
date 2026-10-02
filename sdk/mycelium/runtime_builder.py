@@ -1878,6 +1878,14 @@ class MyceliumConfig:
             from mycelium.storage._helpers import resolve_storage_url
             from mycelium.storage.postgres_ledger import PostgresLedgerStorage
 
+            pool_sizes = {}
+            for field, default in (("pool_min_size", 1), ("pool_max_size", 10)):
+                value = raw.get(field, default)
+                if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                    raise ConfigError(f"'ledger.{field}' must be an integer >= 1")
+                pool_sizes[field] = value
+            if pool_sizes["pool_min_size"] > pool_sizes["pool_max_size"]:
+                raise ConfigError("'ledger.pool_min_size' must be <= 'ledger.pool_max_size'")
             try:
                 dsn = resolve_storage_url(raw, url_key="dsn")
             except ValueError as exc:
@@ -1886,8 +1894,8 @@ class MyceliumConfig:
             return PostgresLedgerStorage(
                 dsn,
                 table=str(raw.get("table", "mycelium_action_ledger")),
-                pool_min_size=int(raw.get("pool_min_size", 1)),
-                pool_max_size=int(raw.get("pool_max_size", 10)),
+                pool_min_size=pool_sizes["pool_min_size"],
+                pool_max_size=pool_sizes["pool_max_size"],
                 retention_seconds=retention,
             )
         if storage_type == "sqlite":
