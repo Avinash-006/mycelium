@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import importlib
 import inspect
+import math
 import os
 import warnings
 from collections.abc import Callable
@@ -1148,7 +1149,7 @@ class MyceliumConfig:
             warn_at_f = float(warn_at)
         except (TypeError, ValueError) as exc:
             raise ConfigError("'budget.warn_at' must be a float in (0, 1]") from exc
-        if not 0.0 < warn_at_f <= 1.0:
+        if not math.isfinite(warn_at_f) or not 0.0 < warn_at_f <= 1.0:
             raise ConfigError("'budget.warn_at' must be a float in (0, 1]")
         on_missing = raw.get("on_missing_meter", ON_MISSING_HARD)
         if on_missing not in ON_MISSING_METER_MODES:
