@@ -28,6 +28,8 @@ small PyPI versions. Pre-release checklist: [sdk/docs/RELEASE.md](sdk/docs/RELEA
 
 ### Fixed
 
+- Reject boolean `budget.warn_at` values instead of interpreting `true` as a
+  warning threshold of `1.0`.
 - Reject a shadowed `range` argument or a changed closure/global binding
   before executing a bounded composite loop, preserving its pinned iteration
   schedule.

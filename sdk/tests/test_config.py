@@ -11,6 +11,7 @@ from mycelium import (
     ARGS_DRIFT_HARD,
     ARGS_DRIFT_SOFT,
     ConfigError,
+    MyceliumConfig,
     ToolBoundaryError,
     config_json_schema,
     get_ledger,
@@ -20,6 +21,34 @@ from mycelium import (
 )
 from mycelium.tool_registry import ToolRegistry
 from mycelium.tool_runner import ToolRunner
+
+
+@pytest.mark.parametrize("warn_at", ["true", "false", ".nan", ".inf", "-.inf", "0", "1.1"])
+def test_budget_warn_at_rejects_invalid_values(warn_at: str) -> None:
+    with pytest.raises(ConfigError, match=r"budget\.warn_at"):
+        cfg = load_config_from_string(f"budget:\n  max_steps: 5\n  warn_at: {warn_at}\n")
+        cfg.build_budget_guard()
+
+
+@pytest.mark.parametrize("warn_at", ["0.8", "1"])
+def test_budget_warn_at_accepts_valid_values(warn_at: str) -> None:
+    cfg = load_config_from_string(f"budget:\n  max_steps: 5\n  warn_at: {warn_at}\n")
+
+    assert cfg.build_budget_guard() is not None
+
+
+@pytest.mark.parametrize("warn_at", [True, False])
+def test_budget_builder_rejects_boolean_warn_at(warn_at: bool) -> None:
+    cfg = MyceliumConfig(
+        tools={},
+        registry_allowed=[],
+        runner_settings={},
+        budget={"max_steps": 5, "warn_at": warn_at},
+    )
+
+    with pytest.raises(ConfigError, match=r"budget\.warn_at"):
+        cfg.build_budget_guard()
+
 
 SAMPLE_YAML = """
 tools:

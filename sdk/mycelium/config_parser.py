@@ -2106,6 +2106,8 @@ def _parse_config(
             raise ConfigError("'budget.tools' must be 'all' or a list of tool names")
         _budget_ceilings_from_config(budget_raw)
         warn_at = budget_raw.get("warn_at", 0.8)
+        if isinstance(warn_at, bool):
+            raise ConfigError("'budget.warn_at' must be a float in (0, 1]")
         try:
             warn_at_f = float(warn_at)
         except (TypeError, ValueError) as exc:
