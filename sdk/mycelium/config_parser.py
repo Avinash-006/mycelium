@@ -2214,7 +2214,9 @@ def _parse_config(
 
     message_validator_raw = data.get("message_validator", False)
     if isinstance(message_validator_raw, dict):
-        message_validator = bool(message_validator_raw.get("enabled", True))
+        message_validator = message_validator_raw.get("enabled", True)
+        if not isinstance(message_validator, bool):
+            raise ConfigError("'message_validator.enabled' must be a bool")
     else:
         message_validator = bool(message_validator_raw)
 
