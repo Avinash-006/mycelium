@@ -1817,8 +1817,15 @@ def _parse_destructive_grant(raw: Any, *, tool: str) -> dict[str, Any]:
         parsed["max_uses"] = value
     if "ttl_seconds" in raw:
         value = raw["ttl_seconds"]
-        if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
-            raise ConfigError(f"destructive_confirm.tools.{tool}.grant.ttl_seconds must be > 0")
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise ConfigError(
+                f"destructive_confirm.tools.{tool}.grant.ttl_seconds must be finite and > 0"
+            )
         parsed["ttl_seconds"] = float(value)
     return parsed
 
