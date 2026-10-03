@@ -1653,6 +1653,9 @@ class MyceliumConfig:
             return None
         if self._state_flush is not None:
             return self._state_flush
+        flush_on_complete = self.state_flush.get("flush_on_complete", True)
+        if not isinstance(flush_on_complete, bool):
+            raise ConfigError("'state_flush.flush_on_complete' must be a bool")
         shared = self._guard_atomic_backend(self.state_flush)
         storage = (
             AtomicStateFlushStorage(shared[0], namespace=f"{shared[1]}:state_flush")
@@ -1662,7 +1665,6 @@ class MyceliumConfig:
         flush_on = self.state_flush.get("flush_on")
         if flush_on is not None and not isinstance(flush_on, list):
             raise ConfigError("'state_flush.flush_on' must be a list")
-        flush_on_complete = bool(self.state_flush.get("flush_on_complete", True))
         self._state_flush = StateFlush(
             storage=storage,
             flush_on=list(flush_on) if flush_on is not None else None,
